@@ -1,5 +1,3 @@
-WASasquach has ended support for WASuite. But maybe it will live on...
-
 # **WAS** Node Suite &nbsp; [![Colab](https://camo.githubusercontent.com/84f0493939e0c4de4e6dbe113251b4bfb5353e57134ffd9fcab6b8714514d4d1/68747470733a2f2f636f6c61622e72657365617263682e676f6f676c652e636f6d2f6173736574732f636f6c61622d62616467652e737667)](https://colab.research.google.com/github/WASasquatch/comfyui-colab-was-node-suite/blob/main/ComfyUI_%2B_WAS_Node_Suite.ipynb) [![Hits](https://hits.seeyoufarm.com/api/count/incr/badge.svg?url=https%3A%2F%2Fgithub.com%2FWASasquatch%2Fwas-node-suite-comfyui&count_bg=%233D9CC8&title_bg=%23555555&icon=&icon_color=%23E7E7E7&title=hits&edge_flat=false)](https://hits.seeyoufarm.com)
 
 <p align="center">
@@ -37,8 +35,9 @@ WASasquach has ended support for WASuite. But maybe it will live on...
  - Bounded Image Crop: Crop a bounds image
  - Bounded Image Crop with Mask: Crop a bounds image by mask
  - CLIPTextEncode (NSP): Parse Noodle Soup Prompts
+ - Conditioning Input Switch: Switch between two conditioning inputs.
  - Constant Number
- - Dictionary to Console: Print a dictionary input to the console	
+ - Dictionary to Console: Print a dictionary input to the console
  - Image Analyze
    - Black White Levels
    - RGB Levels
@@ -64,6 +63,7 @@ WASasquach has ended support for WASuite. But maybe it will live on...
  - Image Generate Gradient: Generate a gradient map with desired stops and colors
  - Image High Pass Filter: Apply a high frequency pass to the image returning the details
  - Image History Loader: Load images from history based on the Load Image Batch node. Can define max history in config file. *(requires restart to show last sessions files at this time)*
+ - Image Input Switch: Switch between two image inputs
  - Image Levels Adjustment: Adjust the levels of a image
  - Image Load: Load a *image* from any path on the system, or a url starting with `http`
  - Image Median Filter: Apply a median filter to a image, such as to smooth out details in surfaces
@@ -109,12 +109,16 @@ WASasquach has ended support for WASuite. But maybe it will live on...
      or things like `*.jpg` to select only JPEG images in the directory specified. 
  - Latent Noise Injection: Inject latent noise into a latent image
  - Latent Size to Number: Latent sizes in tensor width/height
- - Latent Upscale by Factor: Upscale a latent image by a facto
+ - Latent Upscale by Factor: Upscale a latent image by a factor
+ - Latent Input Switch: Switch between two latent inputs 
+ - Logic Boolean: A simple `1` or `0` output to use with logic
  - MiDaS Depth Approximation: Produce a depth approximation of a single image input
  - MiDaS Mask Image: Mask a input image using MiDaS with a desired color
  - Number Operation
  - Number to Seed
  - Number to Float
+ - Number Input Switch: Switch between two number inputs
+ - Number Input Condition: Compare between two inputs or against the A input
  - Number to Int
  - Number to String
  - Number to Text
@@ -130,6 +134,7 @@ WASasquach has ended support for WASuite. But maybe it will live on...
  - Text Find and Replace: Find and replace a substring in a string
  - Text Find and Replace by Dictionary: Replace substrings in a ASCII text input with a dictionary. 
    - The dictionary keys are used as the key to replace, and the list of lines it contains chosen at random based on the seed. 
+ - Text Input Switch: Switch between two text inputs
  - Text Multiline: Write a multiline text string
  - Text Parse A1111 Embeddings: Convert embeddings filenames in your prompts to `embedding:[filename]]` format based on your `/ComfyUI/models/embeddings/` files. 
  - Text Parse Noodle Soup Prompts: Parse NSP in a text input
