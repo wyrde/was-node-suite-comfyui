@@ -19,14 +19,19 @@ from PIL.PngImagePlugin import PngInfo
 from io import BytesIO
 from typing import Optional
 from urllib.request import urlopen
+import comfy.diffusers_convert
 import comfy.samplers
 import comfy.sd
 import comfy.utils
+import comfy.clip_vision
+import model_management
 import folder_paths as comfy_paths
+import model_management
 import glob
 import hashlib
 import json
 import nodes
+import math
 import numpy as np
 import os
 import random
@@ -37,6 +42,7 @@ import subprocess
 import sys
 import time
 import torch
+from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "comfy"))
 sys.path.append('..'+os.sep+'ComfyUI')
@@ -49,16 +55,24 @@ CUSTOM_NODES_DIR = ( os.path.dirname(os.path.dirname(NODE_FILE))
                     if os.path.dirname(os.path.dirname(NODE_FILE)) == 'was-node-suite-comfyui' 
                     or os.path.dirname(os.path.dirname(NODE_FILE)) == 'was-node-suite-comfyui-main' 
                     else os.path.dirname(NODE_FILE) )
-MODELS_DIR =  os.path.join(( os.getcwd()+os.sep+'ComfyUI' if not os.getcwd().startswith('/content') else os.getcwd() ), 'models')
+MODELS_DIR =  comfy_paths.models_dir
 WAS_SUITE_ROOT = os.path.dirname(NODE_FILE)
 WAS_DATABASE = os.path.join(WAS_SUITE_ROOT, 'was_suite_settings.json')
 WAS_HISTORY_DATABASE = os.path.join(WAS_SUITE_ROOT, 'was_history.json')
 WAS_CONFIG_FILE = os.path.join(WAS_SUITE_ROOT, 'was_suite_config.json')
 STYLES_PATH = os.path.join(WAS_SUITE_ROOT, 'styles.json')
+ALLOWED_EXT = ('.jpeg', '.jpg', '.png',
+                        '.tiff', '.gif', '.bmp', '.webp')
+
 
 # WAS Suite Locations Debug
 print('\033[34mWAS Node Suite\033[0m Running At:', NODE_FILE)
 print('\033[34mWAS Node Suite\033[0m Running From:', WAS_SUITE_ROOT)
+
+# Check Write Access
+if not os.access(WAS_SUITE_ROOT, os.W_OK) or not os.access(MODELS_DIR, os.W_OK):
+    print(f'\033[34mWAS Node Suite\033[0m Error: There is no write access to `{WAS_SUITE_ROOT}` or `{MODELS_DIR}`. Write access is required!')
+    exit
 
 #! INSTALLATION CLEANUP
 
@@ -97,7 +111,7 @@ if f_disp:
 #! WAS SUITE CONFIG
 
 was_conf_template = {
-                    "webui_styles": "None",
+                    "webui_styles": None,
                     "webui_styles_persistent_update": True,
                     "blip_model_url": "https://storage.googleapis.com/sfr-vision-language-research/BLIP/models/model_base_capfilt_large.pth",
                     "blip_model_vqa_url": "https://storage.googleapis.com/sfr-vision-language-research/BLIP/models/model_base_vqa_capfilt_large.pth",
@@ -106,6 +120,12 @@ was_conf_template = {
                     "sam_model_vitb_url": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
                     "history_display_limit": 32,
                     "use_legacy_ascii_text": True, # ASCII Legacy is True For Now
+                    "ffmpeg_bin_path": "/path/to/ffmpeg",
+                    "ffmpeg_extra_codecs": {
+                        "avc1": ".mp4",
+                        "h264": ".mkv",
+                    },
+                    "wildcards_path": os.path.join(WAS_SUITE_ROOT, "wildcards"),
                 }
 
 # Create, Load, or Update Config
@@ -120,6 +140,7 @@ def getSuiteConfig():
     except Exception as e:
         print(e)
         return False
+    return was_config
     return was_config
     
 def updateSuiteConfig(conf):
@@ -137,8 +158,11 @@ def updateSuiteConfig(conf):
 if not os.path.exists(WAS_CONFIG_FILE):
     if updateSuiteConfig(was_conf_template):
         print(f'\033[34mWAS Node Suite:\033[0m Created default conf file at `{WAS_CONFIG_FILE}`.')
+        was_config = getSuiteConfig()
     else:
-        print(f'\033[34mWAS Node Suite\033[0m Error: Unable to create default conf file at `{WAS_CONFIG_FILE}`.')
+        print(f'\033[34mWAS Node Suite\033[0m Error: Unable to create default conf file at `{WAS_CONFIG_FILE}`. Using internal config template.')
+        was_config = was_conf_tempalte
+    
 else:
     was_config = getSuiteConfig()
     
@@ -150,19 +174,12 @@ else:
        
     if update_config:
         updateSuiteConfig(was_config)
-        
-    # SET TEXT TYPE
-    TEXT_TYPE = "TEXT"
-    if was_config.__contains__('use_legacy_ascii_text'):
-        if was_config['use_legacy_ascii_text']:
-            TEXT_TYPE = "ASCII"
-            print(f'\033[34mWAS Node Suite\033[0m Warning: use_legacy_ascii_text is `True` in `was_suite_config.json`. `ASCII` type is deprecated and the default will be `TEXT` in the future.')
- 
     
-    # Convert WebUI Styles
+    # Convert WebUI Styles - TODO: Convert to PromptStyles class
     if was_config.__contains__('webui_styles'):
     
         webui_styles_file = was_config['webui_styles'].strip()
+        
         
         if was_config.__contains__('webui_styles_persistent_update'):
             styles_persist = was_config['webui_styles_persistent_update']
@@ -178,6 +195,7 @@ else:
             styles = {}
             with open(webui_styles_file, 'r') as data:
                 for line in csv.DictReader(data):
+                    # Handle encoding garbage
                     if "\ufeffname" in line:
                         name = "\ufeffname"
                     elif "ï»¿name" in line:
@@ -195,7 +213,12 @@ else:
             
             print(f'\033[34mWAS Node Suite:\033[0m Styles import complete.')
 
-            
+# SET TEXT TYPE
+TEXT_TYPE = "TEXT"
+if was_config and was_config.__contains__('use_legacy_ascii_text'):
+    if was_config['use_legacy_ascii_text']:
+        TEXT_TYPE = "ASCII"
+        print(f'\033[34mWAS Node Suite\033[0m Warning: use_legacy_ascii_text is `True` in `was_suite_config.json`. `ASCII` type is deprecated and the default will be `TEXT` in the future.')
 
 #! SUITE SPECIFIC CLASSES & FUNCTIONS
 
@@ -260,6 +283,101 @@ def resizeImage(image, max_size):
             new_width = int(width * (max_size / height))
     resized_image = image.resize((new_width, new_height))
     return resized_image
+    
+# Simple wildcard parser:
+
+def replace_wildcards(text, seed=None, noodle_key='__'):
+    conf = getSuiteConfig()
+    wildcard_dir = os.path.join(WAS_SUITE_ROOT, 'wildcards')
+    if not os.path.exists(wildcard_dir):
+        os.makedirs(wildcard_dir, exist_ok=True)
+    if conf.__contains__('wildcards_path'):
+        if conf['wildcards_path'] not in [None, ""]:
+            wildcard_dir = conf['wildcards_path']
+        
+    print("\033[34mWAS Node Suite\033[0m Wildcard Path:", wildcard_dir)
+
+    # Set the random seed for reproducibility
+    if seed:
+        random.seed(seed)
+
+    # Create a dictionary of key to file path pairs
+    key_path_dict = {}
+    for root, dirs, files in os.walk(wildcard_dir):
+        for file in files:
+            file_path = os.path.join(root, file)
+            key = os.path.relpath(file_path, wildcard_dir).replace(os.path.sep, "/").rsplit(".", 1)[0]
+            key_path_dict[f"{noodle_key}{key}{noodle_key}"] = os.path.abspath(file_path)
+            
+    # Replace keys in text with random lines from corresponding files
+    for key, file_path in key_path_dict.items():
+        with open(file_path, "r", encoding="utf-8") as file:
+            lines = file.readlines()
+            if lines:
+                random_line = None
+                while not random_line:
+                    line = random.choice(lines).strip()
+                    if not line.startswith('#') and not line.startswith('//'):
+                        random_line = line
+                text = text.replace(key, random_line)
+
+    return text
+    
+class PromptStyles:
+    def __init__(self, styles_file, preview_length = 32):
+        self.styles_file = styles_file
+        self.styles = {}
+        self.preview_length = preview_length
+
+        if os.path.exists(self.styles_file):
+            with open(self.styles_file, 'r') as f:
+                self.styles = json.load(f)
+
+    def add_style(self, prompt="", negative_prompt="", auto=False, name=None):
+        if auto:
+            date_format = '%A, %d %B %Y %I:%M %p'
+            date_str = datetime.datetime.now().strftime(date_format)
+            key = None
+            if prompt.strip() != "":
+                if len(prompt) > self.preview_length:
+                    length = self.preview_length
+                else:
+                    length = len(prompt)
+                key = f"[{date_str}] Positive: {prompt[:length]} ..."
+            elif negative_prompt.strip() != "":
+                if len(negative_prompt) > self.preview_length:
+                    length = self.preview_length
+                else:
+                    length = len(negative_prompt)
+                key = f"[{date_str}] Negative: {negative_prompt[:length]} ..."
+            else:
+                raise AttributeError("At least a `prompt`, or `negative_prompt` input is required!")
+        else:
+            if name == None or str(name).strip() == "":
+                raise AttributeError("A `name` input is required when not using `auto=True`")
+            key = str(name)
+
+
+        for k, v in self.styles.items():
+            if v['prompt'] == prompt and v['negative_prompt'] == negative_prompt:
+                return
+
+        self.styles[key] = {"prompt": prompt, "negative_prompt": negative_prompt}
+
+        with open(self.styles_file, "w", encoding='utf-8') as f:
+            json.dump(self.styles, f, indent=4)
+
+    def get_prompts(self):
+        return self.styles
+
+    def get_prompt(self, prompt_key):
+        if prompt_key in self.styles:
+            return self.styles[prompt_key]['prompt'], self.styles[prompt_key]['negative_prompt']
+        else:
+            print(f"Prompt style `{prompt_key}` was not found!")
+            return None, None
+
+
     
 # WAS SETTINGS MANAGER
 
@@ -464,7 +582,7 @@ def update_history_text_files(new_paths):
             HDB.insert("History", "TextFiles", new_paths)
 # WAS Filter Class
 
-class WAS_Filter_Class():
+class WAS_Tools_Class():
 
     # TOOLS
 
@@ -559,7 +677,393 @@ class WAS_Filter_Class():
         Image.Image.paste(canvas, image_b, (im_bx, im_by), image_b_mask.convert('L'))
 
         return canvas
+
+    def morph_images(self, images, steps=10, max_size=512, loop=None, still_duration=30, duration=0.1, output_path='output', filename="morph", filetype="GIF"):
+
+        import cv2
+        import imageio
+
+        # File
+        output_file = os.path.abspath(os.path.join(os.path.join(*output_path.split('/')), filename))
+        output_file += ( '.png' if filetype == 'APNG' else '.gif' )
+
+        # Determine maximum width and height of all the images
+        max_width = max(im.size[0] for im in images)
+        max_height = max(im.size[1] for im in images)
+        max_aspect_ratio = max_width / max_height
+
+        # Pad and resize images as necessary
+        def padded_images():
+            for im in images:
+                aspect_ratio = im.size[0] / im.size[1]
+                if aspect_ratio > max_aspect_ratio:
+                    # Add padding to top and bottom
+                    new_height = int(max_width / aspect_ratio)
+                    padding = (max_height - new_height) // 2
+                    padded_im = Image.new('RGB', (max_width, max_height), color=(0, 0, 0))
+                    padded_im.paste(im.resize((max_width, new_height)), (0, padding))
+                else:
+                    # Add padding to left and right
+                    new_width = int(max_height * aspect_ratio)
+                    padding = (max_width - new_width) // 2
+                    padded_im = Image.new('RGB', (max_width, max_height), color=(0, 0, 0))
+                    padded_im.paste(im.resize((new_width, max_height)), (padding, 0))
+                yield np.array(padded_im)
+
+        # Create a copy of the first image and append it to the end of the images list
+        padded_images = list(padded_images())
+        padded_images.append(padded_images[0].copy())
+
+        # Load images
+        images = padded_images
+
+        # Initialize output frames and durations
+        frames = []
+        durations = []
+
+        # Create morph frames
+        for i in range(len(images)-1):
+            # Add still frame to beginning of transition
+            frames.append(Image.fromarray(images[i]).convert('RGB'))
+            durations.append(still_duration)
+
+            for j in range(steps):
+                alpha = j / float(steps)
+                morph = cv2.addWeighted(images[i], 1 - alpha, images[i+1], alpha, 0)
+                frames.append(Image.fromarray(morph).convert('RGB'))
+                durations.append(duration)
+
+        # Add still frame to end of last image
+        frames.append(Image.fromarray(images[-1]).convert('RGB'))
+        # Add the still frame duration for the last image to the beginning of the durations list
+        durations.insert(0, still_duration)
+
+        # Set durations for still frames during loop
+        if loop is not None:
+            for i in range(loop):
+                durations.insert(0, still_duration)
+                durations.append(still_duration)
+
+        # Save frames as GIF file
+        try:
+            imageio.mimsave(output_file, frames, filetype, duration=durations, loop=loop)
+        except OSError as e:
+            print(f"\033[34mWAS NS\033[0m Error: Unable to save output to {output_file} due to the following error:")
+            print(e)
+        except Exception as e:
+            print(f"\033[34mWAS NS\033[0m Error: Unable to generate GIF due to the following error:")
+            print(e)
+
+        print(f"\033[34mWAS NS:\033[0m Morphing completed. Output saved as {output_file}")
         
+        return output_file  
+
+    class GifMorphWriter:
+        def __init__(self, transition_frames=30, duration_ms=100, still_image_delay_ms=2500, loop=0):
+            self.transition_frames = transition_frames
+            self.duration_ms = duration_ms
+            self.still_image_delay_ms = still_image_delay_ms
+            self.loop = loop
+            
+        def write(self, image, gif_path):
+        
+            import cv2
+        
+            if not os.path.isfile(gif_path):
+                # Create the GIF file if it doesn't exist
+                with Image.new("RGBA", image.size) as new_gif:
+                    # Add first frame
+                    new_gif.paste(image.convert("RGBA"))
+                    new_gif.info["duration"] = self.still_image_delay_ms
+                    new_gif.save(gif_path, format="GIF", save_all=True, append_images=[], duration=self.still_image_delay_ms, loop=0)
+                print(f"\033[34mWAS NS:\033[0m Created new GIF animation at: {gif_path}")
+            else:
+                with Image.open(gif_path) as gif:
+                    # Extract the last still frame of the GIF, if it exists
+                    n_frames = gif.n_frames
+                    if n_frames > 0:
+                        # Extract the last frame
+                        gif.seek(n_frames - 1)
+                        last_frame = gif.copy()
+                    else:
+                        last_frame = None
+                    
+                    # Define end_image to be the input image
+                    end_image = image
+
+                    # Calculate the number of transition frames to add
+                    steps = self.transition_frames - 1 if last_frame is not None else self.transition_frames
+
+                    # Pad the new image to match the size of the last frame, if there is one
+                    if last_frame is not None:
+                        image = self.pad_to_size(image, last_frame.size)
+
+                    # Generate the transition frames from last_frame to image
+                    frames = self.generate_transition_frames(last_frame, image, steps)
+
+                    # Create the still frame
+                    still_frame = end_image.copy()
+
+                    # Populate with original GIF frames up to the last still frame
+                    gif_frames = []
+                    for i in range(n_frames):
+                        gif.seek(i)
+                        gif_frame = gif.copy()
+                        gif_frames.append(gif_frame)
+                                        
+                    # Append transition frames to gif_frames
+                    for frame in frames:
+                        frame.info["duration"] = self.duration_ms
+                        gif_frames.append(frame)
+
+                    # Add the still frame to gif_frames
+                    still_frame.info['duration'] = self.still_image_delay_ms
+                    gif_frames.append(still_frame)
+                    
+                    # Debug Durations
+                    #for i, gf in enumerate(gif_frames):
+                    #    print(f"Frame {i} Duration:", gf.info['duration'])
+
+                    # Save the new GIF
+                    gif_frames[0].save(
+                        gif_path,
+                        format="GIF",
+                        save_all=True,
+                        append_images=gif_frames[1:],
+                        optimize=True,
+                        loop=self.loop,
+                    )
+
+                    print(f"\033[34mWAS NS:\033[0m Edited existing GIF animation at: {gif_path}")
+
+                
+        def pad_to_size(self, image, size):
+            # Pad the image with transparent pixels to match the desired size
+            new_image = Image.new("RGBA", size, color=(0, 0, 0, 0))
+            x_offset = (size[0] - image.width) // 2
+            y_offset = (size[1] - image.height) // 2
+            new_image.paste(image, (x_offset, y_offset))
+            return new_image
+
+        def generate_transition_frames(self, start_frame, end_image, num_frames):
+
+            # Generate transition frames between two images
+            if start_frame is None:
+                return [image]
+                
+            start_frame = start_frame.convert("RGBA")
+            end_image = end_image.convert("RGBA")
+
+            # Create a list of interpolated frames
+            frames = []
+            for i in range(1, num_frames + 1):
+                weight = i / (num_frames + 1)
+                frame = Image.blend(start_frame, end_image, weight)
+                frames.append(frame)
+            return frames
+            
+    class VideoWriter:
+        def __init__(self, transition_frames=30, fps=25, still_image_delay_sec=2, 
+                        max_size=512, codec="mp4v"):
+            conf = getSuiteConfig()
+            self.transition_frames = transition_frames
+            self.fps = fps
+            self.still_image_delay_frames = round(still_image_delay_sec * fps)
+            self.max_size = int(max_size)
+            self.valid_codecs = ["ffv1","mp4v"]
+            self.extensions = {"ffv1":".mkv","mp4v":".mp4"} 
+            if conf.__contains__('ffmpeg_extra_codecs'):
+                self.add_codecs(conf['ffmpeg_extra_codecs'])
+            self.codec = codec.lower() if codec.lower() in self.valid_codecs else "mp4v"
+
+        def write(self, image, video_path):
+            import cv2
+            import os
+
+            # Setup video path extension
+            video_path += self.extensions[self.codec]
+
+            # Convert the input image to a cv2 image
+            end_image = self.rescale(self.pil2cv(image), self.max_size)
+
+            if os.path.isfile(video_path):
+                # If the video file already exists, load it
+                cap = cv2.VideoCapture(video_path)
+
+                # Get the video dimensions
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fps = int(cap.get(cv2.CAP_PROP_FPS))
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+                # Create a temporary file to hold the new frames
+                temp_file_path = video_path.replace(self.extensions[self.codec], '_temp'+self.extensions[self.codec])
+                fourcc = cv2.VideoWriter_fourcc(*self.codec)
+                out = cv2.VideoWriter(temp_file_path, fourcc, fps, (width, height), isColor=True)
+
+                # Write the original frames to the temporary file
+                for i in tqdm(range(total_frames), desc="Copying original frames"):
+                    ret, frame = cap.read()
+                    out.write(frame)
+
+                # Create transition
+                if self.transition_frames > 0:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames - 1)
+                    ret, last_frame = cap.read()
+                    transition_frames = self.generate_transition_frames(last_frame, end_image, self.transition_frames)
+                    for i, transition_frame in tqdm(enumerate(transition_frames), desc="Generating transition frames", total=self.transition_frames):
+                        transition_frame_resized = cv2.resize(transition_frame, (width, height))
+                        out.write(transition_frame_resized)
+
+                # Add the new image frames to the temporary file
+                for i in tqdm(range(self.still_image_delay_frames), desc="Adding new frames"):
+                    out.write(end_image)
+
+                # Release resources
+                cap.release()
+                out.release()
+
+                # Replace the original video file with the temporary file
+                os.remove(video_path)
+                os.rename(temp_file_path, video_path)
+
+                print(f"\033[34mWAS NS:\033[0m Edited video at: {video_path}")
+
+                return video_path
+
+            else:
+                # If the video file doesn't exist, create it
+                fourcc = cv2.VideoWriter_fourcc(*self.codec)
+                height, width, _ = end_image.shape
+                out = cv2.VideoWriter(video_path, fourcc, self.fps, (width, height), isColor=True)
+
+                # Write the still image for the specified duration
+                for i in tqdm(range(self.still_image_delay_frames), desc="Adding new frames"):
+                    out.write(end_image)
+
+                # Release resources
+                out.release()
+
+                print(f"\033[34mWAS NS:\033[0m Created new video at: {video_path}")
+
+                return video_path
+
+            return ""
+
+        def create_video(self, image_folder, video_path):
+            import cv2
+            from tqdm import tqdm
+
+            # Get a list of the image files in the folder, sorted alphabetically
+            image_paths = sorted([os.path.join(image_folder, f) for f in os.listdir(image_folder) 
+                                  if os.path.isfile(os.path.join(image_folder, f)) 
+                                  and os.path.join(image_folder, f).lower().endswith(ALLOWED_EXT)])
+
+            # Check that there are image files in the folder
+            if len(image_paths) == 0:
+                print(f"\033[31mERR:\033[0m No valid image files found in `{image_folder}` directory. Valid image formats are", *sort(ALLOWED_EXT), end=" ")
+                return
+
+            # Output file including extension
+            output_file = video_path + self.extensions[self.codec]
+
+            # Load the first image to get the dimensions
+            image = self.rescale(cv2.imread(image_paths[0]), self.max_size)
+            height, width = image.shape[:2]
+
+            # Create a VideoWriter object
+            fourcc = cv2.VideoWriter_fourcc(*self.codec)
+            out = cv2.VideoWriter(output_file, fourcc, self.fps, (width, height), isColor=True)
+
+            # Write still frames for the first image
+            out.write(image)
+            for _ in range(self.still_image_delay_frames - 1):
+                out.write(image)
+
+            for i in tqdm(range(len(image_paths)), desc="Writing video frames"):
+                # Load frame(s)
+                start_frame = cv2.imread(image_paths[i])
+                end_frame = None
+                if i+1 <= len(image_paths)-1:
+                    end_frame = self.rescale(cv2.imread(image_paths[i+1]), self.max_size)
+
+                # Create transition frames
+                if isinstance(end_frame, np.ndarray):
+                    transition_frames = self.generate_transition_frames(start_frame, end_frame, self.transition_frames)
+                    # Resize transition frames to match video size
+                    transition_frames = [cv2.resize(frame, (width, height)) for frame in transition_frames]
+                    # Write transition frames to the video
+                    for _, frame in enumerate(transition_frames):
+                        out.write(frame)
+
+                    # Write still frames for the current image after the transition frames
+                    for _ in range(self.still_image_delay_frames - self.transition_frames):
+                        out.write(end_frame)
+
+                else:
+                    # No transition frames for the last image in the folder
+                    out.write(start_frame)
+                    for _ in range(self.still_image_delay_frames - 1):
+                        out.write(start_frame)
+
+            # Release resources
+            out.release()
+
+            if os.path.exists(output_file):
+                print(f"\033[34mWAS NS:\033[0m Created video at: {output_file}")
+                return output_file
+            else:
+                print(f"\033[34mWAS Node Suite\033[0m Error: Unable to create video at: {output_file}")
+                return ""
+
+        def rescale(self, image, max_size):
+            f1 = max_size / image.shape[1]
+            f2 = max_size / image.shape[0]
+            f = min(f1, f2)
+            dim = (int(image.shape[1] * f), int(image.shape[0] * f))
+            resized = cv2.resize(image, dim)
+            return resized
+            
+        def generate_transition_frames(self, img1, img2, num_frames):
+            import cv2
+            if img1 is None and img2 is None:
+                return []
+            
+            # Resize the images if necessary
+            if img1 is not None and img2 is not None:
+                if img1.shape != img2.shape:
+                    img2 = cv2.resize(img2, img1.shape[:2][::-1])
+            elif img1 is not None:
+                img2 = np.zeros_like(img1)
+            else:
+                img1 = np.zeros_like(img2)
+            
+            height, width, _ = img2.shape
+            
+            frame_sequence = []
+            for i in range(num_frames):
+                alpha = i / float(num_frames)
+                blended = cv2.addWeighted(img1, 1 - alpha, img2, alpha,
+                                              gamma=0.0, dtype=cv2.CV_8U)
+                frame_sequence.append(blended)
+            
+            return frame_sequence
+            
+        def pil2cv(self, img):
+            import cv2
+            img = np.array(img) 
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)  
+            return img
+            
+        def add_codecs(self, codecs): 
+            if isinstance(codecs, dict):
+                codec_forcc_codes = codecs.keys()
+                self.valid_codecs.extend(codec_forcc_codes)
+                self.extensions.update(codecs)
+                
+        def get_codecs(self):
+            return self.valid_codecs
+
         
     # FILTERS
     
@@ -1152,10 +1656,10 @@ class WAS_Shadow_And_Highlight_Adjustment:
     
     def apply_shadow_and_highlight(self, image, shadow_threshold=30, highlight_threshold=220, shadow_factor=1.5, highlight_factor=0.5, shadow_smoothing=0, highlight_smoothing=0, simplify_isolation=0):
 
-        WFilter = WAS_Filter_Class()
+        WTools = WAS_Tools_Class()
         
-        result, shadows, highlights = WFilter.shadows_and_highlights(tensor2pil(image), shadow_threshold, highlight_threshold, shadow_factor, highlight_factor, shadow_smoothing, highlight_smoothing, simplify_isolation)
-        result, shadows, highlights = WFilter.shadows_and_highlights(tensor2pil(image), shadow_threshold, highlight_threshold, shadow_factor, highlight_factor, shadow_smoothing, highlight_smoothing, simplify_isolation)
+        result, shadows, highlights = WTools.shadows_and_highlights(tensor2pil(image), shadow_threshold, highlight_threshold, shadow_factor, highlight_factor, shadow_smoothing, highlight_smoothing, simplify_isolation)
+        result, shadows, highlights = WTools.shadows_and_highlights(tensor2pil(image), shadow_threshold, highlight_threshold, shadow_factor, highlight_factor, shadow_smoothing, highlight_smoothing, simplify_isolation)
         
         return (pil2tensor(result), pil2tensor(shadows), pil2tensor(highlights) )
         
@@ -1184,7 +1688,7 @@ class WAS_Image_Filters:
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "image_filters"
 
-    CATEGORY = "WAS Suite/Image/Adjustment"
+    CATEGORY = "WAS Suite/Image/Filter"
 
     def image_filters(self, image, brightness, contrast, saturation, sharpness, blur, gaussian_blur, edge_enhance):
 
@@ -1310,7 +1814,7 @@ class WAS_Image_Style_Filter:
         image = tensor2pil(image)
 
         # WAS Filters
-        WFilter = WAS_Filter_Class()
+        WTools = WAS_Tools_Class()
 
         # Apply blending
         if style:
@@ -1327,7 +1831,7 @@ class WAS_Image_Style_Filter:
             elif style == "earlybird":
                 out_image = pilgram.earlybird(image)
             elif style == "fairy tale":
-                out_image = WFilter.sparkle(image)
+                out_image = WTools.sparkle(image)
             elif style == "gingham":
                 out_image = pilgram.gingham(image)
             elif style == "hudson":
@@ -1376,6 +1880,759 @@ class WAS_Image_Style_Filter:
 
         return (torch.from_numpy(np.array(out_image).astype(np.float32) / 255.0).unsqueeze(0), )
 
+
+# IMAGE CROP FACE
+
+class WAS_Image_Crop_Face:
+    def __init__(self):
+        pass
+        
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "crop_padding_factor": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "cascade_xml": ([
+                                "lbpcascade_animeface.xml",
+                                "haarcascade_frontalface_default.xml", 
+                                "haarcascade_frontalface_alt.xml", 
+                                "haarcascade_frontalface_alt2.xml",
+                                "haarcascade_frontalface_alt_tree.xml",
+                                "haarcascade_profileface.xml",
+                                "haarcascade_upperbody.xml"
+                                ],),
+                "use_face_recognition_gpu": (["false","true"],),
+            }
+        }
+    
+    RETURN_TYPES = ("IMAGE", "CROP_DATA")
+    FUNCTION = "image_crop_face"
+    
+    CATEGORY = "WAS Suite/Image/Process"
+    
+    def image_crop_face(self, image, cascade_xml=None, crop_padding_factor=0.25, use_face_recognition_gpu="false"):
+    
+        use_fr = False if use_face_recognition_gpu.strip().lower() == 'false' else True
+        
+        if use_fr:
+            if 'face_recognition' not in packages():
+                print("\033[34mWAS NS:\033[0m Installing face_recognition...")
+                subprocess.check_call([sys.executable, '-m', 'pip', '-q', 'install', 'face_recognition'])
+        
+        return self.crop_face(tensor2pil(image), cascade_xml, crop_padding_factor, use_fr)
+    
+    def crop_face(self, image, cascade_name=None, padding=0.25, use_fr=False):
+    
+        import cv2
+        if use_fr:
+            import face_recognition
+
+        img = np.array(image.convert('RGB'))
+
+        if use_fr:
+            face_location = face_recognition.face_locations(img)
+        else:
+            face_location = None
+
+        cascades = [ os.path.join(os.path.join(WAS_SUITE_ROOT, 'res'), 'lbpcascade_animeface.xml'), 
+                    os.path.join(os.path.join(WAS_SUITE_ROOT, 'res'), 'haarcascade_frontalface_default.xml'), 
+                    os.path.join(os.path.join(WAS_SUITE_ROOT, 'res'), 'haarcascade_frontalface_alt.xml'), 
+                    os.path.join(os.path.join(WAS_SUITE_ROOT, 'res'), 'haarcascade_frontalface_alt2.xml'), 
+                    os.path.join(os.path.join(WAS_SUITE_ROOT, 'res'), 'haarcascade_frontalface_alt_tree.xml'), 
+                    os.path.join(os.path.join(WAS_SUITE_ROOT, 'res'), 'haarcascade_profileface.xml'), 
+                    os.path.join(os.path.join(WAS_SUITE_ROOT, 'res'), 'haarcascade_upperbody.xml') ]
+                    
+        if cascade_name:
+            for cascade in cascades:
+                if os.path.basename(cascade) == cascade_name:
+                    cascades.remove(cascade)
+                    cascades.insert(0, cascade)
+                    break
+
+        faces = None
+        if not face_location:
+            if use_fr:
+                print(f"\033[34mWAS NS\033[0m Warning: Unable to find any faces with face_recognition, switching to cascade recognition...")
+            for cascade in cascades:
+                if not os.path.exists(cascade):
+                    print(f"\033[34mWAS NS\033[0m Error: Unable to find cascade XML file at `{cascade}`.",
+                        "Did you pull the latest files from https://github.com/WASasquatch/was-node-suite-comfyui repo?")
+                    return (pil2tensor(Image.new("RGB", (512,512), (0,0,0))), False)
+                face_cascade = cv2.CascadeClassifier(cascade)
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+                if len(faces) != 0:
+                    print("\033[34mWAS NS\033[0m: Face found with:", os.path.basename(cascade))
+                    break
+            if len(faces) == 0:
+                print("\033[34mWAS NS\033[0m Warning: No faces found in the image!")
+                return (pil2tensor(Image.new("RGB", (512,512), (0,0,0))), False)
+        else: 
+            print("\033[34mWAS NS\033[0m: Face found with: face_recognition model")
+            faces = face_location
+            
+        # Assume there is only one face in the image
+        x, y, w, h = faces[0]
+        
+        # Check if the face region aligns with the edges of the original image
+        left_adjust = max(0, -x)
+        right_adjust = max(0, x + w - img.shape[1])
+        top_adjust = max(0, -y)
+        bottom_adjust = max(0, y + h - img.shape[0])
+
+        # Check if the face region is near any edges, and if so, pad in the opposite direction
+        if left_adjust < w:
+            x += right_adjust
+        elif right_adjust < w:
+            x -= left_adjust
+        if top_adjust < h:
+            y += bottom_adjust
+        elif bottom_adjust < h:
+            y -= top_adjust
+
+        w -= left_adjust + right_adjust
+        h -= top_adjust + bottom_adjust
+        
+        # Calculate padding around face
+        face_size = min(h, w)
+        y_pad = int(face_size * padding)
+        x_pad = int(face_size * padding)
+        
+        # Calculate square coordinates around face
+        center_x = x + w // 2
+        center_y = y + h // 2
+        half_size = (face_size + max(x_pad, y_pad)) // 2
+        top = max(0, center_y - half_size)
+        bottom = min(img.shape[0], center_y + half_size)
+        left = max(0, center_x - half_size)
+        right = min(img.shape[1], center_x + half_size)
+        
+        # Ensure square crop of the original image
+        crop_size = min(right - left, bottom - top)
+        left = center_x - crop_size // 2
+        right = center_x + crop_size // 2
+        top = center_y - crop_size // 2
+        bottom = center_y + crop_size // 2
+        
+        # Crop face from original image
+        face_img = img[top:bottom, left:right, :]
+        
+        # Resize image
+        size = max(face_img.copy().shape[:2])
+        pad_h = (size - face_img.shape[0]) // 2
+        pad_w = (size - face_img.shape[1]) // 2
+        face_img = cv2.copyMakeBorder(face_img, pad_h, pad_h, pad_w, pad_w, cv2.BORDER_CONSTANT, value=[0,0,0])
+        min_size = 64 # Set minimum size for padded image
+        if size < min_size:
+            size = min_size
+        face_img = cv2.resize(face_img, (size, size))
+        
+        # Convert numpy array back to PIL image
+        face_img = Image.fromarray(face_img)
+
+        # Resize image to a multiple of 64
+        original_size = face_img.size
+        face_img.resize((((face_img.size[0] // 64) * 64 + 64), ((face_img.size[1] // 64) * 64 + 64)))
+        
+        # Return face image and coordinates
+        return (pil2tensor(face_img.convert('RGB')), (original_size, (left, top, right, bottom)))
+
+
+# IMAGE PASTE FACE CROP
+
+class WAS_Image_Paste_Face_Crop:
+    def __init__(self):
+        pass
+        
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "crop_image": ("IMAGE",),
+                "crop_data": ("CROP_DATA",),
+                "crop_blending": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "crop_sharpening": ("INT", {"default": 0, "min": 0, "max": 3, "step": 1}),
+            }
+        }
+    
+    RETURN_TYPES = ("IMAGE", "IMAGE")
+    RETURN_NAMES = ("IMAGE", "MASK_IMAGE")
+    FUNCTION = "image_paste_face"
+    
+    CATEGORY = "WAS Suite/Image/Process"
+    
+    def image_paste_face(self, image, crop_image, crop_data=None, crop_blending=0.25, crop_sharpening=0):
+    
+        if crop_data == False:
+            print("\033[34mWAS NS\033[0m Error: No valid crop data found!")
+            return (image, pil2tensor(Image.new("RGB", tensor2pil(image).size, (0,0,0))))
+
+        result_image, result_mask = self.paste_face(tensor2pil(image), tensor2pil(crop_image), crop_data[0], crop_data[1], crop_blending, crop_sharpening)
+        return(result_image, result_mask)
+        
+    def paste_face(self, image, face_img, original_size, face_coords, blend_amount=0.25, sharpen_amount=1):
+    
+        face_img = face_img.convert("RGB").resize(original_size)
+        
+        if sharpen_amount > 0:
+            for _ in range(sharpen_amount):
+                face_img = face_img.filter(ImageFilter.SHARPEN)
+
+        if blend_amount > 1.0: 
+            blend_amount = 1.0
+        elif blend_amount < 0.0:
+            blend_amount = 0.0
+        blend_ratio = (max(face_img.size[0], face_img.size[1]) / 2) * float(blend_amount)
+
+        blend = image.convert("RGBA")
+        mask = Image.new("L", image.size, 0)
+        offset_x = int(original_size[0] * (blend_amount + blend_amount / 2.5))
+        offset_y = int(original_size[1] * (blend_amount + blend_amount / 2.5))
+        mask_block_size = (original_size[0]-offset_x, original_size[1]-offset_y)
+        mask_block = Image.new("L", mask_block_size, 255)
+        Image.Image.paste(mask, mask_block, (int(face_coords[0]+offset_x/2), int(face_coords[1]+offset_y/2)))
+        Image.Image.paste(blend, face_img, (face_coords[0], face_coords[1]))
+
+        mask = mask.filter(ImageFilter.BoxBlur(radius=blend_ratio/2))
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=blend_ratio/2))
+
+        blend.putalpha(mask)
+        image = Image.alpha_composite(image.convert("RGBA"), blend)
+        
+        return (pil2tensor(image.convert('RGB')), pil2tensor(mask.convert('RGB')))
+
+
+# IMAGE CROP LOCATION
+
+class WAS_Image_Crop_Location:
+    def __init__(self):
+        pass
+        
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "top": ("INT", {"default":0, "max": 10000000, "min":0, "step":1}),
+                "left": ("INT", {"default":0, "max": 10000000, "min":0, "step":1}),
+                "right": ("INT", {"default":256, "max": 10000000, "min":0, "step":1}),
+                "bottom": ("INT", {"default":256, "max": 10000000, "min":0, "step":1}),
+            }
+        }
+    
+    RETURN_TYPES = ("IMAGE", "CROP_DATA")
+    FUNCTION = "image_crop_location"
+    
+    CATEGORY = "WAS Suite/Image/Process"
+    
+    def image_crop_location(self, image, top=0, left=0, right=256, bottom=256):
+    
+        image = tensor2pil(image)
+        img_width, img_height = image.size
+        
+        # Ensure that the coordinates are within the image bounds
+        top = min(max(top, 0), img_height)
+        left = min(max(left, 0), img_width)
+        bottom = min(max(bottom, 0), img_height)
+        right = min(max(right, 0), img_width)
+        
+        crop = image.crop((left, top, right, bottom))
+        crop_data = (crop.copy().size, (top, left, bottom, right))
+        crop = crop.resize((((crop.size[0] // 64) * 64 + 64), ((crop.size[1] // 64) * 64 + 64)))
+        
+        return (pil2tensor(crop), crop_data)
+        
+        
+# IMAGE PASTE CROP
+
+class WAS_Image_Paste_Crop:
+    def __init__(self):
+        pass
+        
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+                "required": {
+                    "image": ("IMAGE",),
+                    "crop_image": ("IMAGE",),
+                    "crop_data": ("CROP_DATA",),
+                    "crop_blending": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}),
+                    "crop_sharpening": ("INT", {"default": 0, "min": 0, "max": 3, "step": 1}),
+                }
+            }
+            
+    RETURN_TYPES = ("IMAGE", "IMAGE")
+    FUNCTION = "image_paste_crop"
+    
+    CATEGORY = "WAS Suite/Image/Process"
+    
+    def image_paste_crop(self, image, crop_image, crop_data=None, crop_blending=0.25, crop_sharpening=0):
+    
+        if crop_data == False:
+            print("\033[34mWAS NS\033[0m Error: No valid crop data found!")
+            return (image, pil2tensor(Image.new("RGB", tensor2pil(image).size, (0,0,0))))
+
+        result_image, result_mask = self.paste_image(tensor2pil(image), crop_data, tensor2pil(crop_image), crop_blending, crop_sharpening)
+        return (result_image, result_mask)
+    
+    def paste_image(self, image, crop_data, crop_img, blend_amount=0.25, sharpen_amount=1):
+    
+        def inset_border(image, border_width=20, border_color=(0)):
+            width, height = image.size
+            bordered_image = Image.new(image.mode, (width, height), border_color)
+            bordered_image.paste(image, (0, 0))
+            draw = ImageDraw.Draw(bordered_image)
+            draw.rectangle((0, 0, width-1, height-1), outline=border_color, width=border_width)
+            return bordered_image
+    
+        crop_size, (left, top, right, bottom) = crop_data
+        crop_img = crop_img.convert("RGB").resize(crop_size)
+        
+        if sharpen_amount > 0:
+            for _ in range(sharpen_amount):
+                crop_img = crop_img.filter(ImageFilter.SHARPEN)
+
+        if blend_amount > 1.0: 
+            blend_amount = 1.0
+        elif blend_amount < 0.0:
+            blend_amount = 0.0
+        blend_ratio = (max(crop_img.size) / 2) * float(blend_amount)
+
+        blend = image.convert("RGBA")
+        mask = Image.new("L", image.size, 0)
+        
+        mask_block = Image.new("L", crop_size, 255)
+        mask_block = inset_border(mask_block, int(blend_ratio/2), (0))
+        
+        Image.Image.paste(mask, mask_block, (top, left))
+        Image.Image.paste(blend, crop_img, (top, left))
+
+        mask = mask.filter(ImageFilter.BoxBlur(radius=blend_ratio / 4))
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=blend_ratio / 4))
+
+        blend.putalpha(mask)
+        image = Image.alpha_composite(image.convert("RGBA"), blend)
+        
+        return (pil2tensor(image.convert('RGB')), pil2tensor(mask.convert('RGB')))        
+        
+# IMAGE PASTE CROP BY LOCATION
+
+class WAS_Image_Paste_Crop_Location:
+    def __init__(self):
+        pass
+        
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+                "required": {
+                    "image": ("IMAGE",),
+                    "crop_image": ("IMAGE",),
+                    "top": ("INT", {"default":0, "max": 10000000, "min":0, "step":1}),
+                    "left": ("INT", {"default":0, "max": 10000000, "min":0, "step":1}),
+                    "right": ("INT", {"default":256, "max": 10000000, "min":0, "step":1}),
+                    "bottom": ("INT", {"default":256, "max": 10000000, "min":0, "step":1}),
+                    "crop_blending": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}),
+                    "crop_sharpening": ("INT", {"default": 0, "min": 0, "max": 3, "step": 1}),
+                }
+            }
+            
+    RETURN_TYPES = ("IMAGE", "IMAGE")
+    FUNCTION = "image_paste_crop_location"
+    
+    CATEGORY = "WAS Suite/Image/Process"
+    
+    def image_paste_crop_location(self, image, crop_image, top=0, left=0, right=256, bottom=256, crop_blending=0.25, crop_sharpening=0):
+
+        result_image, result_mask = self.paste_image(tensor2pil(image), tensor2pil(crop_image), top, left, right, bottom, crop_blending, crop_sharpening)
+        return (result_image, result_mask)
+    
+    def paste_image(self, image, crop_image, top=0, left=0, right=256, bottom=256, blend_amount=0.25, sharpen_amount=1):
+    
+        def inset_border(image, border_width=20, border_color=(0)):
+            width, height = image.size
+            bordered_image = Image.new(image.mode, (width, height), border_color)
+            bordered_image.paste(image, (0, 0))
+            draw = ImageDraw.Draw(bordered_image)
+            draw.rectangle((0, 0, width-1, height-1), outline=border_color, width=border_width)
+            return bordered_image
+    
+        img_width, img_height = image.size
+        
+        # Ensure that the coordinates are within the image bounds
+        top = min(max(top, 0), img_height)
+        left = min(max(left, 0), img_width)
+        bottom = min(max(bottom, 0), img_height)
+        right = min(max(right, 0), img_width)
+        
+        crop_size = (right - left, bottom - top)
+        crop_img = crop_image.convert("RGB")
+        crop_img = crop_img.resize(crop_size)
+            
+        if sharpen_amount > 0:
+            for _ in range(sharpen_amount):
+                crop_img = crop_img.filter(ImageFilter.SHARPEN)
+
+        if blend_amount > 1.0: 
+            blend_amount = 1.0
+        elif blend_amount < 0.0:
+            blend_amount = 0.0
+        blend_ratio = (max(crop_size) / 2) * float(blend_amount)
+
+        blend = image.convert("RGBA")
+        mask = Image.new("L", image.size, 0)
+        
+        mask_block = Image.new("L", crop_size, 255)
+        mask_block = inset_border(mask_block, int(blend_ratio/2), (0))
+     
+        Image.Image.paste(mask, mask_block, (left, top))
+        Image.Image.paste(blend, crop_img, (left, top))
+
+        mask = mask.filter(ImageFilter.BoxBlur(radius=blend_ratio/4))
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=blend_ratio/4))
+
+        blend.putalpha(mask)
+        image = Image.alpha_composite(image.convert("RGBA"), blend)
+            
+        return (pil2tensor(image.convert('RGB')), pil2tensor(mask.convert('RGB'))) 
+
+# IMAGE GRID IMAGE
+
+class WAS_Image_Grid_Image:
+    def __init__(self):
+        pass
+        
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images_path": ("STRING", {"default":"./ComfyUI/input/", "multiline": False}),
+                "pattern_glob": ("STRING", {"default":"*", "multiline": False}),
+                "include_subfolders": (["false", "true"],),
+                "border_width": ("INT", {"default":3, "min": 0, "max": 100, "step":1}),
+                "number_of_columns": ("INT", {"default":6, "min": 1, "max": 24, "step":1}),
+                "max_cell_size": ("INT", {"default":256, "min":32, "max":1280, "step":1}),
+                "border_red": ("INT", {"default":0, "min": 0, "max": 255, "step":1}),
+                "border_green": ("INT", {"default":0, "min": 0, "max": 255, "step":1}),
+                "border_blue": ("INT", {"default":0, "min": 0, "max": 255, "step":1}),
+            }
+        }
+        
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "create_grid_image"
+    
+    CATEGORY = "WAS Suite/Image/Process"
+    
+    def create_grid_image(self, images_path, pattern_glob="*", include_subfolders="false", number_of_columns=6, 
+                            max_cell_size=256, border_width=3, border_red=0, border_green=0, border_blue=0):
+    
+        if not os.path.exists(images_path):
+            print(f"\033[34mWAS NS\033[0m Error: The grid image path `{images_path}` does not exist!")
+            return (pil2tensor(Image.new("RGB", (512,512), (0,0,0))),)
+        
+        paths = glob.glob(os.path.join(images_path, pattern_glob), recursive=(False if include_subfolders == "false" else True))
+        image_paths = []
+        for path in paths:
+            if path.lower().endswith(ALLOWED_EXT) and os.path.exists(path):
+                image_paths.append(path)
+        
+        grid_image = self.smart_grid_image(image_paths, int(number_of_columns), (int(max_cell_size), int(max_cell_size)), 
+                                                (False if border_width <= 0 else True), (int(border_red), 
+                                                int(border_green), int(border_blue)), int(border_width))
+                                                
+        return (pil2tensor(grid_image),)
+    
+    def smart_grid_image(self, images, cols=6, size=(256,256), add_border=False, border_color=(0,0,0), border_width=3):
+            
+        # calculate row height
+        max_width, max_height = size
+        row_height = 0
+        images_resized = []
+        for image in images:
+            img = Image.open(image).convert('RGB')
+                
+            img_w, img_h = img.size
+            aspect_ratio = img_w / img_h
+            if aspect_ratio > 1: # landscape
+                thumb_w = min(max_width, img_w-border_width)
+                thumb_h = thumb_w / aspect_ratio
+            else: # portrait
+                thumb_h = min(max_height, img_h-border_width)
+                thumb_w = thumb_h * aspect_ratio
+
+            # pad the image to match the maximum size and center it within the cell
+            pad_w = max_width - int(thumb_w)
+            pad_h = max_height - int(thumb_h)
+            left = pad_w // 2
+            top = pad_h // 2
+            right = pad_w - left
+            bottom = pad_h - top
+            padding = (left, top, right, bottom)  # left, top, right, bottom
+            img_resized = ImageOps.expand(img.resize((int(thumb_w), int(thumb_h))), padding)
+
+            if add_border:
+                img_resized_bordered = ImageOps.expand(img_resized, border=border_width//2, fill=border_color)
+                    
+            images_resized.append(img_resized)
+            row_height = max(row_height, img_resized.size[1])
+        row_height = int(row_height)
+
+        # calculate the number of rows
+        total_images = len(images_resized)
+        rows = math.ceil(total_images / cols)
+
+        # create empty image to put thumbnails
+        new_image = Image.new('RGB', (cols*size[0]+(cols-1)*border_width, rows*row_height+(rows-1)*border_width), border_color)
+
+        for i, img in enumerate(images_resized):
+            if add_border:
+                border_img = ImageOps.expand(img, border=border_width//2, fill=border_color)
+                x = (i % cols) * (size[0]+border_width)
+                y = (i // cols) * (row_height+border_width)
+                if border_img.size == (size[0], size[1]):
+                    new_image.paste(border_img, (x, y, x+size[0], y+size[1]))
+                else:
+                    # Resize image to match size parameter
+                    border_img = border_img.resize((size[0], size[1]))
+                    new_image.paste(border_img, (x, y, x+size[0], y+size[1]))
+            else:
+                x = (i % cols) * (size[0]+border_width)
+                y = (i // cols) * (row_height+border_width)
+                if img.size == (size[0], size[1]):
+                    new_image.paste(img, (x, y, x+img.size[0], y+img.size[1]))
+                else:
+                    # Resize image to match size parameter
+                    img = img.resize((size[0], size[1]))
+                    new_image.paste(img, (x, y, x+size[0], y+size[1]))
+                    
+        new_image = ImageOps.expand(new_image, border=border_width, fill=border_color)
+
+        return new_image
+
+# IMAGE MORPH GIF
+
+class WAS_Image_Morph_GIF:
+    def __init__(self):
+        pass
+        
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image_a": ("IMAGE",),
+                "image_b": ("IMAGE",),
+                "transition_frames": ("INT", {"default":30, "min":2, "max":60, "step":1}),
+                "still_image_delay_ms": ("FLOAT", {"default":2500.0, "min":0.1, "max":60000.0, "step":0.1}),
+                "duration_ms": ("FLOAT", {"default":0.1, "min":0.1, "max":60000.0, "step":0.1}),
+                "loops": ("INT", {"default":0, "min":0, "max":100, "step":1}),
+                "max_size": ("INT", {"default":512, "min":128, "max":1280, "step":1}),
+                "output_path": ("STRING", {"default": "./ComfyUI/output", "multiline": False}),
+                "filename": ("STRING", {"default": "morph", "multiline": False}),
+                "filetype": (["GIF", "APNG"],),
+            }
+        }
+        
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("NaN")
+        
+    RETURN_TYPES = ("IMAGE","IMAGE",TEXT_TYPE,TEXT_TYPE)
+    RETURN_NAMES = ("image_a_pass","image_b_pass","filepath_text","filename_text")
+    FUNCTION = "create_morph_gif"
+    
+    CATEGORY = "WAS Suite/Animation"
+    
+    def create_morph_gif(self, image_a, image_b, transition_frames=10, still_image_delay_ms=10, duration_ms=0.1, loops=0, max_size=512, 
+                            output_path="./ComfyUI/output", filename="morph", filetype="GIF"):
+                
+        if 'imageio' not in packages():
+            print("\033[34mWAS NS:\033[0m Installing imageio...")
+            subprocess.check_call(
+                [sys.executable, '-m', 'pip', '-q', 'install', 'imageio'])
+        
+        if filetype not in ["APNG", "GIF"]:
+            filetype = "GIF"
+        if output_path.strip() in [None, "", "."]:
+            output_path = "./ComfyUI/output"
+        output_path = tokens.parseTokens(os.path.join(*output_path.split('/')))
+        if not os.path.exists(output_path):
+            os.makedirs(output_path, exist_ok=True)
+            
+        if image_a == None:
+            image_a = pil2tensor(Image.new("RGB", (512,512), (0,0,0)))
+        if image_b == None:
+            image_b = pil2tensor(Image.new("RGB", (512,512), (255,255,255)))
+                    
+        if transition_frames < 2:
+            transition_frames = 2
+        elif transition_frames > 60:
+            transition_frames = 60
+        
+        if duration_ms < 0.1:
+            duration_ms = 0.1
+        elif duration_ms > 60000.0:
+            duration_ms = 60000.0
+            
+        tokens = TextTokens()
+        WTools = WAS_Tools_Class()
+            
+        output_file = WTools.morph_images([tensor2pil(image_a), tensor2pil(image_b)], steps=int(transition_frames), max_size=int(max_size), loop=int(loops), 
+                            still_duration=int(still_image_delay_ms), duration=int(duration_ms), output_path=output_path,
+                            filename=tokens.parseTokens(filename), filetype=filetype)
+        
+        return (image_a, image_b, output_file)
+        
+
+# IMAGE MORPH GIF WRITER
+
+class WAS_Image_Morph_GIF_Writer:
+    def __init__(self):
+        pass
+        
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "transition_frames": ("INT", {"default":30, "min":2, "max":60, "step":1}),
+                "image_delay_ms": ("FLOAT", {"default":2500.0, "min":0.1, "max":60000.0, "step":0.1}),
+                "duration_ms": ("FLOAT", {"default":0.1, "min":0.1, "max":60000.0, "step":0.1}),
+                "loops": ("INT", {"default":0, "min":0, "max":100, "step":1}),
+                "max_size": ("INT", {"default":512, "min":128, "max":1280, "step":1}),
+                "output_path": ("STRING", {"default": "./ComfyUI/output", "multiline": False}),
+                "filename": ("STRING", {"default": "morph_writer", "multiline": False}),
+            }
+        }
+        
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("NaN")
+        
+    RETURN_TYPES = ("IMAGE",TEXT_TYPE,TEXT_TYPE)
+    RETURN_NAMES = ("IMAGE_PASS","filepath_text","filename_text")
+    FUNCTION = "write_to_morph_gif"
+    
+    CATEGORY = "WAS Suite/Animation/Writer"
+    
+    def write_to_morph_gif(self, image, transition_frames=10, image_delay_ms=10, duration_ms=0.1, loops=0, max_size=512, 
+                            output_path="./ComfyUI/output", filename="morph"):
+                
+        if 'imageio' not in packages():
+            print("\033[34mWAS NS:\033[0m Installing imageio...")
+            subprocess.check_call(
+                [sys.executable, '-m', 'pip', '-q', 'install', 'imageio'])
+        
+        if output_path.strip() in [None, "", "."]:
+            output_path = "./ComfyUI/output"
+            
+        if image == None:
+            image = pil2tensor(Image.new("RGB", (512,512), (0,0,0)))
+            
+        if transition_frames < 2:
+            transition_frames = 2
+        elif transition_frames > 60:
+            transition_frames = 60
+        
+        if duration_ms < 0.1:
+            duration_ms = 0.1
+        elif duration_ms > 60000.0:
+            duration_ms = 60000.0
+            
+        tokens = TextTokens()
+        output_path = os.path.abspath(os.path.join(*tokens.parseTokens(output_path).split('/')))
+        output_file = os.path.join(output_path, tokens.parseTokens(filename)+'.gif')
+        
+        if not os.path.exists(output_path):
+            os.makedirs(output_path, exist_ok=True)
+        
+        WTools = WAS_Tools_Class()
+        GifMorph = WTools.GifMorphWriter(int(transition_frames), int(duration_ms), int(image_delay_ms))
+        GifMorph.write(tensor2pil(image), output_file)
+        
+        return (image, output_file, filename)        
+
+# IMAGE MORPH GIF BY PATH
+
+class WAS_Image_Morph_GIF_By_Path:
+    def __init__(self):
+        pass
+        
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "transition_frames": ("INT", {"default":30, "min":2, "max":60, "step":1}),
+                "still_image_delay_ms": ("FLOAT", {"default":2500.0, "min":0.1, "max":60000.0, "step":0.1}),
+                "duration_ms": ("FLOAT", {"default":0.1, "min":0.1, "max":60000.0, "step":0.1}),
+                "loops": ("INT", {"default":0, "min":0, "max":100, "step":1}),
+                "max_size": ("INT", {"default":512, "min":128, "max":1280, "step":1}),
+                "input_path": ("STRING",{"default":"./ComfyUI", "multiline": False}),
+                "input_pattern": ("STRING",{"default":"*", "multiline": False}),
+                "output_path": ("STRING", {"default": "./ComfyUI/output", "multiline": False}),
+                "filename": ("STRING", {"default": "morph", "multiline": False}),
+                "filetype": (["GIF", "APNG"],),
+            }
+        }
+        
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("NaN")
+        
+    RETURN_TYPES = (TEXT_TYPE,TEXT_TYPE)
+    RETURN_NAMES = ("filepath_text","filename_text")
+    FUNCTION = "create_morph_gif"
+    
+    CATEGORY = "WAS Suite/Animation"
+    
+    def create_morph_gif(self, transition_frames=30, still_image_delay_ms=2500, duration_ms=0.1, loops=0, max_size=512, 
+                            input_path="./ComfyUI/output", input_pattern="*", output_path="./ComfyUI/output", filename="morph", filetype="GIF"):
+                
+        if 'imageio' not in packages():
+            print("\033[34mWAS NS:\033[0m Installing imageio...")
+            subprocess.check_call(
+                [sys.executable, '-m', 'pip', '-q', 'install', 'imageio'])
+                
+        if not os.path.exists(input_path):
+            print(f"\033[34mWAS NS\033[0m Error: the input_path `{input_path}` does not exist!")
+            return ("",)
+            
+        images = self.load_images(input_path, input_pattern)
+        if not images:
+            print(f"\033[34mWAS NS\033[0m Error: The input_path `{input_path}` does not contain any valid images!")
+            return ("",)
+            
+        if filetype not in ["APNG", "GIF"]:
+            filetype = "GIF"
+        if output_path.strip() in [None, "", "."]:
+            output_path = "./ComfyUI/output"
+                    
+        if transition_frames < 2:
+            transition_frames = 2
+        elif transition_frames > 60:
+            transition_frames = 60
+        
+        if duration_ms < 0.1:
+            duration_ms = 0.1
+        elif duration_ms > 60000.0:
+            duration_ms = 60000.0
+            
+        tokens = TextTokens()
+        WTools = WAS_Tools_Class()
+            
+        output_file = WTools.morph_images(images, steps=int(transition_frames), max_size=int(max_size), loop=int(loops), still_duration=int(still_image_delay_ms), 
+                                            duration=int(duration_ms), output_path=tokens.parseTokens(os.path.join(*output_path.split('/'))),
+                                            filename=tokens.parseTokens(filename), filetype=filetype)
+        
+        return (output_file,filename)
+        
+
+    def load_images(self, directory_path, pattern):
+        images = []
+        for file_name in glob.glob(os.path.join(directory_path, pattern), recursive=False):
+            if file_name.lower().endswith(ALLOWED_EXT):
+                images.append(Image.open(file_name).convert("RGB"))
+        return images
 
 
 # COMBINE NODE
@@ -1541,16 +2798,16 @@ class WAS_Image_Monitor_Distortion_Filter:
         image = tensor2pil(image)
         
         # WAS Filters
-        WFilter = WAS_Filter_Class()
+        WTools = WAS_Tools_Class()
 
         # Apply image effect
         if mode:
             if mode == 'Digital Distortion':
-                image = WFilter.digital_distortion(image, amplitude, offset)
+                image = WTools.digital_distortion(image, amplitude, offset)
             elif mode == 'Signal Distortion':
-                image = WFilter.signal_distortion(image, amplitude)
+                image = WTools.signal_distortion(image, amplitude)
             elif mode == 'TV Distortion':
-                image = WFilter.tv_vhs_distortion(image, amplitude)  
+                image = WTools.tv_vhs_distortion(image, amplitude)  
             else:
                 image = image
 
@@ -1587,9 +2844,9 @@ class WAS_Image_Perlin_Noise_Filter:
         if width > 1024 or height > 1024 and octaves > 6:
             octaves = 6
     
-        WFilter = WAS_Filter_Class()
+        WTools = WAS_Tools_Class()
         
-        image = WFilter.perlin_noise(width, height, shape, density, octaves, seed)
+        image = WTools.perlin_noise(width, height, shape, density, octaves, seed)
 
         return (pil2tensor(image), )        
         
@@ -1619,9 +2876,9 @@ class WAS_Image_Voronoi_Noise_Filter:
 
     def voronoi_noise_filter(self, width, height, density, modulator, seed):
     
-        WFilter = WAS_Filter_Class()
+        WTools = WAS_Tools_Class()
         
-        image = WFilter.worley_noise(height=width, width=height, density=density, option=modulator, use_broadcast_ops=True).image
+        image = WTools.worley_noise(height=width, width=height, density=density, option=modulator, use_broadcast_ops=True).image
 
         return (pil2tensor(image), )        
 
@@ -1651,9 +2908,9 @@ class WAS_Image_Make_Seamless:
 
     def make_seamless(self, image, blending, tiled, tiles):
     
-        WFilter = WAS_Filter_Class()
+        WTools = WAS_Tools_Class()
         
-        image = WFilter.make_seamless(tensor2pil(image), blending, tiled, tiles)
+        image = WTools.make_seamless(tensor2pil(image), blending, tiled, tiles)
 
         return (pil2tensor(image), )
         
@@ -1685,7 +2942,7 @@ class WAS_Image_Color_Palette:
         image = tensor2pil(image)
         
         # WAS Filters
-        WFilter = WAS_Filter_Class()
+        WTools = WAS_Tools_Class()
 
         res_dir = os.path.join(WAS_SUITE_ROOT, 'res')
         font = os.path.join(res_dir, 'font.ttf')
@@ -1696,7 +2953,7 @@ class WAS_Image_Color_Palette:
             print(f'\033[34mWAS NS:\033[0m Found font at `{font}`')
 
         # Generate Color Palette
-        image = WFilter.generate_palette(image, colors, 128, 10, font, 15)
+        image = WTools.generate_palette(image, colors, 128, 10, font, 15)
 
         return (pil2tensor(image), )
         
@@ -1728,14 +2985,14 @@ class WAS_Image_Analyze:
         image = tensor2pil(image)
         
         # WAS Filters
-        WFilter = WAS_Filter_Class()
+        WTools = WAS_Tools_Class()
 
         # Analye Image
         if mode:
             if mode == 'Black White Levels':
-                image = WFilter.black_white_levels(image)
+                image = WTools.black_white_levels(image)
             elif mode == 'RGB Levels':
-                image = WFilter.channel_frequency(image)
+                image = WTools.channel_frequency(image)
             else:
                 image = image
 
@@ -1774,7 +3031,7 @@ class WAS_Image_Generate_Gradient:
         import io
     
         # WAS Filters
-        WFilter = WAS_Filter_Class()
+        WTools = WAS_Tools_Class()
 
         colors_dict = {}
         stops = io.StringIO(gradient_stops.strip().replace(' ',''))
@@ -1783,7 +3040,7 @@ class WAS_Image_Generate_Gradient:
             colors = parts[1].replace('\n','').split(',')
             colors_dict[parts[0].replace('\n','')] = colors
         
-        image = WFilter.gradient((width, height), direction, colors_dict, tolerance)
+        image = WTools.gradient((width, height), direction, colors_dict, tolerance)
 
         return (pil2tensor(image), )        
 
@@ -1815,9 +3072,9 @@ class WAS_Image_Gradient_Map:
         gradient_image = tensor2pil(gradient_image)
         
         # WAS Filters
-        WFilter = WAS_Filter_Class()
+        WTools = WAS_Tools_Class()
             
-        image = WFilter.gradient_map(image, gradient_image, (True if flip_left_right == 'true' else False))
+        image = WTools.gradient_map(image, gradient_image, (True if flip_left_right == 'true' else False))
 
         return (pil2tensor(image), )
 
@@ -1997,10 +3254,8 @@ class WAS_Load_Image_Batch:
             self.label = label
 
         def load_images(self, directory_path, pattern):
-            allowed_extensions = ('.jpeg', '.jpg', '.png',
-                                  '.tiff', '.gif', '.bmp', '.webp')
             for file_name in glob.glob(os.path.join(directory_path, pattern), recursive=True):
-                if file_name.lower().endswith(allowed_extensions):
+                if file_name.lower().endswith(ALLOWED_EXT):
                     image_path = os.path.join(directory_path, file_name)
                     self.image_paths.append(image_path)
 
@@ -2104,9 +3359,9 @@ class WAS_Image_Stitch:
         if feathering > 2048:
             raise ValueError(f"\033[34mWAS NS\033[0m Error: The stitch feathering of `{feathering}` is too high. Please choose a value between `0` and `2048`")
             
-        WFilter = WAS_Filter_Class();
+        WTools = WAS_Tools_Class();
         
-        stitched_image = WFilter.stitch_image(tensor2pil(image_a), tensor2pil(image_b), stitch, feathering)
+        stitched_image = WTools.stitch_image(tensor2pil(image_a), tensor2pil(image_b), stitch, feathering)
         
         return (pil2tensor(stitched_image), )
 
@@ -2903,8 +4158,6 @@ class WAS_Canny_Filter:
 
     def canny_filter(self, image, threshold_low, threshold_high, enable_threshold):
 
-        self.install_opencv()
-
         if enable_threshold == 'false':
             threshold_low = None
             threshold_high = None
@@ -3017,12 +4270,6 @@ class WAS_Canny_Filter:
         # gradients of edges
         return mag
 
-    def install_opencv(self):
-        if 'opencv-python' not in packages():
-            print("\033[34mWAS NS:\033[0m Installing CV2...")
-            subprocess.check_call([sys.executable, '-m', 'pip', '-q', 'install', 'opencv-python'])
-
-
 # IMAGE EDGE DETECTION
 
 class WAS_Image_Edge:
@@ -3085,11 +4332,6 @@ class WAS_Image_fDOF:
     CATEGORY = "WAS Suite/Image/Filter"
 
     def fdof_composite(self, image, depth, radius, samples, mode):
-
-        if 'opencv-python' not in packages():
-            print("\033[34mWAS NS:\033[0m Installing CV2...")
-            subprocess.check_call(
-                [sys.executable, '-m', 'pip', '-q', 'install', 'opencv-python'])
 
         import cv2 as cv
 
@@ -3159,9 +4401,9 @@ class WAS_Dragon_Filter:
     
     def apply_dragan_filter(self, image, saturation, contrast, sharpness, brightness, highpass_radius, highpass_samples, highpass_strength, colorize):
     
-        WFilter = WAS_Filter_Class()
+        WTools = WAS_Tools_Class()
         
-        image = WFilter.dragan_filter(tensor2pil(image), saturation, contrast, sharpness, brightness, highpass_radius, highpass_samples, highpass_strength, colorize)
+        image = WTools.dragan_filter(tensor2pil(image), saturation, contrast, sharpness, brightness, highpass_radius, highpass_samples, highpass_strength, colorize)
         
         return (pil2tensor(image), )
      
@@ -3224,11 +4466,6 @@ class WAS_Image_Select_Color:
     CATEGORY = "WAS Suite/Image/Process"
 
     def select_color(self, image, red=255, green=255, blue=255, variance=10):
-
-        if 'opencv-python' not in packages():
-            print("\033[34mWAS NS:\033[0m Installing CV2...")
-            subprocess.check_call(
-                [sys.executable, '-m', 'pip', '-q', 'install', 'opencv-python'])
 
         image = self.color_pick(tensor2pil(image), red, green, blue, variance)
 
@@ -3366,7 +4603,7 @@ class WAS_Image_Save:
                 "images": ("IMAGE", ),
                 "output_path": ("STRING", {"default": './ComfyUI/output', "multiline": False}),
                 "filename_prefix": ("STRING", {"default": "ComfyUI"}),
-                "extension": (['png', 'jpeg', 'tiff', 'gif'], ),
+                "extension": (['png', 'jpeg', 'gif', 'tiff'], ),
                 "quality": ("INT", {"default": 100, "min": 1, "max": 100, "step": 1}),
                 "overwrite_mode": (["false", "prefix_as_filename"],),
             },
@@ -3376,13 +4613,13 @@ class WAS_Image_Save:
         }
 
     RETURN_TYPES = ()
-    FUNCTION = "save_images"
+    FUNCTION = "was_save_images"
 
     OUTPUT_NODE = True
 
     CATEGORY = "WAS Suite/IO"
 
-    def save_images(self, images, output_path='', filename_prefix="ComfyUI", extension='png', quality=100, prompt=None, extra_pnginfo=None, overwrite_mode='false'):
+    def was_save_images(self, images, output_path='', filename_prefix="ComfyUI", extension='png', quality=100, prompt=None, extra_pnginfo=None, overwrite_mode='false'):
         def map_filename(filename):
             prefix_len = len(filename_prefix)
             prefix = filename[:prefix_len + 1]
@@ -3391,13 +4628,17 @@ class WAS_Image_Save:
             except:
                 digits = 0
             return (digits, prefix)
+        
+        # Define token system
+        tokens = TextTokens()
+        output_path = tokens.parseTokens(output_path)
 
         # Setup custom path or default
         if output_path.strip() != '':
             if not os.path.exists(output_path.strip()):
                 print(f'\033[34mWAS NS\033[0m Warning: The path `{output_path.strip()}` specified doesn\'t exist! Creating directory.')
-                os.mkdir(output_path.strip())
-            self.output_dir = os.path.normpath(output_path.strip())
+                os.makedirs(output_path.strip(), exist_ok=True)
+            self.output_dir = output_path.strip()
 
         # Setup counter
         try:
@@ -3406,8 +4647,11 @@ class WAS_Image_Save:
         except ValueError:
             counter = 1
         except FileNotFoundError:
-            os.mkdir(self.output_dir)
+            os.makedirs(self.output_dir, exist_ok=True)
             counter = 1
+            
+        # Set Extension
+        file_extension = ( extension if extension in ['png', 'jpeg', 'gif', 'tiff', 'gif'] else 'png' )
 
         paths = list()
         for image in images:
@@ -3421,37 +4665,47 @@ class WAS_Image_Save:
                     metadata.add_text(x, json.dumps(extra_pnginfo[x]))
                 
             # Parse prefix tokens
-            tokens = TextTokens()
             filename_prefix = tokens.parseTokens(filename_prefix)
 
             if overwrite_mode == 'prefix_as_filename':
-                file = f"{filename_prefix}.{extension}"
+                file = f"{filename_prefix}.{file_extension}"
             else:
-                file = f"{filename_prefix}_{counter:05}_.{extension}"
+                file = f"{filename_prefix}_{counter:05}_.{file_extension}"
                 if os.path.exists(os.path.join(self.output_dir, file)):
                     counter += 1
-                    file = f"{filename_prefix}_{counter:05}_.{extension}"
-
-            if extension == 'png':
-                img.save(os.path.join(self.output_dir, file),
-                         pnginfo=metadata, optimize=True)
-            elif extension == 'webp':
-                img.save(os.path.join(self.output_dir, file), quality=quality)
-            elif extension == 'jpeg':
-                img.save(os.path.join(self.output_dir, file),
-                         quality=quality, optimize=True)
-            elif extension == 'tiff':
-                img.save(os.path.join(self.output_dir, file),
-                         quality=quality, optimize=True)
-            else:
-                img.save(os.path.join(self.output_dir, file))
-            paths.append(file)
+                    file = f"{filename_prefix}_{counter:05}_.{file_extension}"
+            try:
+                output_file = os.path.abspath(os.path.join(self.output_dir, file))
+                if extension == 'png':
+                    img.save(output_file,
+                             pnginfo=metadata, optimize=True)
+                    print(f'\033[34mWAS NS:\033[0m Image file saved to:', output_file)
+                elif extension == 'webp':
+                    img.save(output_file, quality=quality)
+                    print(f'\033[34mWAS NS:\033[0m Image file saved to:', output_file)
+                elif extension == 'jpeg':
+                    img.save(output_file,
+                             quality=quality, optimize=True)
+                    print(f'\033[34mWAS NS:\033[0m Image file saved to:', output_file)
+                elif extension == 'tiff':
+                    img.save(output_file,
+                             quality=quality, optimize=True)
+                    print(f'\033[34mWAS NS:\033[0m Image file saved to:', output_file)
+                else:
+                    img.save(output_file)
+                paths.append(file)
+            except OSError as e:
+                print(f'\033[34mWAS NS\033[0m Error: Unable to save file to:', output_file)
+                print(e)
+            except Exception as e:
+                print(f'\033[34mWAS NS\033[0m Error: Unable to save file due to the following error:')
+                print(e)
+            
             if overwrite_mode == 'false':
                 counter += 1
                 
         return {"ui": {"images": paths}}
-
-
+        
 # LOAD IMAGE NODE
 class WAS_Load_Image:
 
@@ -3746,10 +5000,6 @@ class MiDaS_Depth_Approx:
             print("\033[34mWAS NS:\033[0m Installing timm...")
             subprocess.check_call(
                 [sys.executable, '-m', 'pip', '-q', 'install', 'timm'])
-        if 'opencv-python' not in packages():
-            print("\033[34mWAS NS:\033[0m Installing CV2...")
-            subprocess.check_call(
-                [sys.executable, '-m', 'pip', '-q', 'install', 'opencv-python'])
         MIDAS_INSTALLED = True
 
 # MIDAS REMOVE BACKGROUND/FOREGROUND NODE
@@ -3915,10 +5165,6 @@ class MiDaS_Background_Foreground_Removal:
             print("\033[34mWAS NS:\033[0m Installing timm...")
             subprocess.check_call(
                 [sys.executable, '-m', 'pip', '-q', 'install', 'timm'])
-        if 'opencv-python' not in packages():
-            print("\033[34mWAS NS:\033[0m Installing CV2...")
-            subprocess.check_call(
-                [sys.executable, '-m', 'pip', '-q', 'install', 'opencv-python'])
         MIDAS_INSTALLED = True
 
 
@@ -3935,6 +5181,7 @@ class WAS_NSP_CLIPTextEncoder:
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "mode": (["Noodle Soup Prompts", "Wildcards"],),
                 "noodle_key": ("STRING", {"default": '__', "multiline": False}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "text": ("STRING", {"multiline": True}),
@@ -3948,41 +5195,48 @@ class WAS_NSP_CLIPTextEncoder:
 
     CATEGORY = "WAS Suite/Conditioning"
 
-    def nsp_encode(self, clip, text, noodle_key='__', seed=0):
+    def nsp_encode(self, clip, text, mode="Noodle Soup Prompts", noodle_key='__', seed=0):
+    
+        if mode == "Noodle Soup Prompts":
 
-        # Fetch the NSP Pantry
-        local_pantry = os.path.join(WAS_SUITE_ROOT, 'nsp_pantry.json')
-        if not os.path.exists(local_pantry):
-            response = urlopen('https://raw.githubusercontent.com/WASasquatch/noodle-soup-prompts/main/nsp_pantry.json')
-            tmp_pantry = json.loads(response.read())
-            # Dump JSON locally
-            pantry_serialized = json.dumps(tmp_pantry, indent=4)
-            with open(local_pantry, "w") as f:
-                f.write(pantry_serialized)
-            del response, tmp_pantry
+            # Fetch the NSP Pantry
+            local_pantry = os.path.join(WAS_SUITE_ROOT, 'nsp_pantry.json')
+            if not os.path.exists(local_pantry):
+                response = urlopen('https://raw.githubusercontent.com/WASasquatch/noodle-soup-prompts/main/nsp_pantry.json')
+                tmp_pantry = json.loads(response.read())
+                # Dump JSON locally
+                pantry_serialized = json.dumps(tmp_pantry, indent=4)
+                with open(local_pantry, "w") as f:
+                    f.write(pantry_serialized)
+                del response, tmp_pantry
 
-        # Load local pantry
-        with open(local_pantry, 'r') as f:
-            nspterminology = json.load(f)
+            # Load local pantry
+            with open(local_pantry, 'r') as f:
+                nspterminology = json.load(f)
 
-        if seed > 0 or seed < 0:
-            random.seed(seed)
-
-        # Parse Text
-        new_text = text
-        for term in nspterminology:
-            # Target Noodle
-            tkey = f'{noodle_key}{term}{noodle_key}'
-            # How many occurances?
-            tcount = new_text.count(tkey)
-            # Apply random results for each noodle counted
-            for _ in range(tcount):
-                new_text = new_text.replace(
-                    tkey, random.choice(nspterminology[term]), 1)
-                seed = seed+1
+            if seed > 0 or seed < 0:
                 random.seed(seed)
 
-        print('\033[34mWAS NS\033[0m CLIPTextEncode NSP:', new_text)
+            # Parse Text
+            new_text = text
+            for term in nspterminology:
+                # Target Noodle
+                tkey = f'{noodle_key}{term}{noodle_key}'
+                # How many occurances?
+                tcount = new_text.count(tkey)
+                # Apply random results for each noodle counted
+                for _ in range(tcount):
+                    new_text = new_text.replace(
+                        tkey, random.choice(nspterminology[term]), 1)
+                    seed = seed+1
+                    random.seed(seed)
+
+            print('\033[34mWAS NS\033[0m CLIPTextEncode NSP:\n', new_text)
+            
+        else:
+        
+            new_text = replace_wildcards(text, (None if seed == 0 else seed), noodle_key)
+            print('\033[34mWAS NS\033[0m CLIPTextEncode Wildcards:\n', new_text)
 
         return ([[clip.encode(new_text), {}]], {"ui": {"prompt": new_text}})
 
@@ -4474,7 +5728,7 @@ class WAS_Text_Save:
             print(
                 f'\033[34mWAS NS\033[0m Warning: The path `{path}` doesn\'t exist! Creating it...')
             try:
-                os.mkdir(path)
+                os.makedirs(path, exist_ok=True)
             except OSError as e:
                 print(
                     f'\033[34mWAS NS\033[0m Warning: The path `{path}` could not be created! Is there write access?\n{e}')
@@ -4617,7 +5871,9 @@ class WAS_Text_Parse_Tokens:
         tokens = TextTokens()
         return (tokens.parseTokens(text), )
         
-        
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("NaN")      
         
 # TEXT ADD TOKENS
 
@@ -4702,6 +5958,10 @@ class WAS_Text_Add_Token_Input:
         print(json.dumps(tk.custom_tokens, indent=4))
         
         return (token_name, token_value)
+        
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("NaN")      
 
 
 
@@ -4818,7 +6078,6 @@ class WAS_Text_Load_From_File:
             
         return ("\n".join(lines), dictionary)
 
-# LOAD TEXT TO STRING
 
 class WAS_Text_To_String:
     def __init__(self):
@@ -4839,6 +6098,53 @@ class WAS_Text_To_String:
 
     def text_to_string(self, text):
         return (text, )
+        
+class WAS_Text_To_Number:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": (TEXT_TYPE,),
+            }
+        }
+
+    RETURN_TYPES = ("NUMBER",)
+    FUNCTION = "text_to_number"
+
+    CATEGORY = "WAS Suite/Text/Operations"
+
+    def text_to_number(self, text):
+        if text.replace(".", "").isnumeric():
+            number = float(text)
+        else:
+            number = int(text)
+        return (number, )
+        
+        
+class WAS_String_To_Text:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "string": ("STRING", {}),
+            }
+        }
+
+    RETURN_TYPES = (TEXT_TYPE,)
+    FUNCTION = "string_to_text"
+
+    CATEGORY = "WAS Suite/Text/Operations"
+
+    def string_to_text(self, string):
+        return (string, )
+        
+        
 
 
 
@@ -4933,7 +6239,7 @@ class WAS_BLIP_Analyze_Image:
             
             blip_dir = os.path.join(MODELS_DIR, 'blip')
             if not os.path.exists(blip_dir):
-                os.mkdir(blip_dir)
+                os.makedirs(blip_dir, exist_ok=True)
                 
             torch.hub.set_dir(blip_dir)
         
@@ -4959,7 +6265,7 @@ class WAS_BLIP_Analyze_Image:
             
             blip_dir = os.path.join(MODELS_DIR, 'blip')
             if not os.path.exists(blip_dir):
-                os.mkdir(blip_dir)
+                os.makedirs(blip_dir, exist_ok=True)
                 
             torch.hub.set_dir(blip_dir)
 
@@ -5029,9 +6335,9 @@ class WAS_SAM_Model_Loader:
         
         sys.path.append(os.path.join(WAS_SUITE_ROOT, 'repos'+os.sep+'SAM'))
         
-        sam_dir = os.path.join(( os.getcwd()+os.sep+'ComfyUI' if not os.getcwd().startswith('/content') else os.getcwd() ), 'models'+os.sep+'sam')
+        sam_dir = os.path.join(MODELS_DIR, 'sam')
         if not os.path.exists(sam_dir):
-            os.mkdir(sam_dir)
+            os.makedirs(sam_dir, exist_ok=True)
         
         sam_file = os.path.join(sam_dir, model_filename)
         if not os.path.exists(sam_file):
@@ -5221,7 +6527,7 @@ class WAS_Inset_Image_Bounds:
 
         # Check if the resulting bounds are valid
         if rmin > rmax or cmin > cmax:
-            raise ValueError("Invalid insets provided. Please make sure the insets do not exceed the image bounds.")
+            raise ValueError("\033[34mWAS NS\033[33m Error:\033[0m Invalid insets provided. Please make sure the insets do not exceed the image bounds.")
         
         image_bounds = [rmin, rmax, cmin, cmax]
         
@@ -5322,7 +6628,7 @@ class WAS_Bounded_Image_Crop:
 
         # Check if the provided bounds are valid
         if rmin > rmax or cmin > cmax:
-            raise ValueError("Invalid bounds provided. Please make sure the bounds are within the image dimensions.")
+            raise ValueError("\033[34mWAS NS\033[33m Error:\033[0m Invalid bounds provided. Please make sure the bounds are within the image dimensions.")
 
         # Crop the image using the provided bounds and return it
         return (image[:, rmin:rmax+1, cmin:cmax+1, :],)
@@ -5467,6 +6773,73 @@ class WAS_Random_Number:
 
         # Return number
         return (number, )
+        
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("NaN")
+
+# TRUE RANDOM NUMBER
+
+class WAS_True_Random_Number:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "api_key": ("STRING",{"default":"00000000-0000-0000-0000-000000000000", "multiline": False}),
+                "minimum": ("FLOAT", {"default": 0, "min": -18446744073709551615, "max": 18446744073709551615}),
+                "maximum": ("FLOAT", {"default": 10000000, "min": -18446744073709551615, "max": 18446744073709551615}),
+            }
+        }
+
+    RETURN_TYPES = ("NUMBER",)
+    FUNCTION = "return_true_randm_number"
+
+    CATEGORY = "WAS Suite/Number"
+
+    def return_true_randm_number(self, api_key=None, minimum=0, maximum=10):
+
+        # Get Random Number
+        number = self.get_random_numbers(api_key=api_key, minimum=minimum, maximum=maximum)[0]
+
+        # Return number
+        return (number, )
+        
+    def get_random_numbers(self, api_key=None, amount=1, minimum=0, maximum=10):
+        '''Get random number(s) from random.org'''
+        if api_key in [None, '00000000-0000-0000-0000-000000000000', '']:
+            print("\033[34mWAS NS\033[33m Error:\033[0m No API key provided! A valid RANDOM.ORG API key is required to use `True Random.org Number Generator`")
+            return [0]
+            
+        url = "https://api.random.org/json-rpc/2/invoke"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "generateIntegers",
+            "params": {
+                "apiKey": api_key,
+                "n": amount,
+                "min": minimum,
+                "max": maximum,
+                "replacement": True,
+                "base": 10
+            },
+            "id": 1
+        }
+        
+        response = requests.post(url, headers=headers, data=json.dumps(payload))
+        if response.status_code == 200:
+            data = response.json()
+            if "result" in data:
+                return data["result"]["random"]["data"]
+                
+        return [0]
+        
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("NaN")
 
 
 # CONSTANT NUMBER
@@ -5763,7 +7136,30 @@ class WAS_Number_Operation:
             else:
                 return number_a
 
+# NUMBER MULTIPLE OF
 
+class WAS_Number_Multiple_Of:
+    def __init__(self):
+        pass
+        
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "number": ("NUMBER",),
+                "multiple": ("INT", {"default": 8, "min": -18446744073709551615, "max": 18446744073709551615}),
+            }
+        }
+    
+    RETURN_TYPES =("NUMBER",)
+    FUNCTION = "number_multiple_of"
+    
+    CATEGORY = "WAS Suite/Number/Functions"
+    
+    def number_multiple_of(self, number, multiple=8):
+        if number % multiple != 0:
+            return ((number // multiple) * multiple + multiple, )
+        return (number, )
 
 
 #! MISC
@@ -5820,11 +7216,10 @@ class WAS_Latent_Size_To_Number:
         i = 0
         for tensor in samples['samples'][0]:
             if not isinstance(tensor, torch.Tensor):
-                raise ValueError(f'\033[34mWAS NS\033[33m Error: Input should be a torch.Tensor')
+                raise ValueError(f'\033[34mWAS NS\033[0m Error: Input should be a torch.Tensor')
             shape = tensor.shape
             tensor_height = shape[-2]
             tensor_width = shape[-1]
-            print(tensor)
             size_dict.update({i:[tensor_width, tensor_height]})
         return (size_dict[0][0], size_dict[0][1])
         
@@ -5905,8 +7300,6 @@ class WAS_Number_Input_Condition:
                 result = number_a if number_b % number_a == 0 else number_b
             else:
                 result = number_a
-
-            print(result)
 
         return (result,)
         
@@ -6070,16 +7463,430 @@ class WAS_Debug_Number_to_Console:
     @classmethod
     def IS_CHANGED(cls, **kwargs):
         return float("NaN")
+        
+        
+# CUSTOM COMFYUI NODES
+
+class WAS_Checkpoint_Loader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": { "config_name": (comfy_paths.get_filename_list("configs"), ),
+                              "ckpt_name": (comfy_paths.get_filename_list("checkpoints"), )}}
+    RETURN_TYPES = ("MODEL", "CLIP", "VAE", "STRING")
+    RETURN_NAMES = ("MODEL", "CLIP", "VAE", "NAME_STRING")
+    FUNCTION = "load_checkpoint"
+
+    CATEGORY = "WAS Suite/Loaders/Advanced"
+
+    def load_checkpoint(self, config_name, ckpt_name, output_vae=True, output_clip=True):
+        config_path = comfy_paths.get_full_path("configs", config_name)
+        ckpt_path = comfy_paths.get_full_path("checkpoints", ckpt_name)
+        out = comfy.sd.load_checkpoint(config_path, ckpt_path, output_vae=True, output_clip=True, embedding_directory=comfy_paths.get_folder_paths("embeddings"))
+        return (out[0], out[1], out[2], os.path.splitext(os.path.basename(ckpt_name))[0])
+
+class WAS_Checkpoint_Loader_Simple:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": { "ckpt_name": (comfy_paths.get_filename_list("checkpoints"), ),
+                             }}
+    RETURN_TYPES = ("MODEL", "CLIP", "VAE", "STRING")
+    RETURN_NAMES = ("MODEL", "CLIP", "VAE", "NAME_STRING")
+    FUNCTION = "load_checkpoint"
+
+    CATEGORY = "WAS Suite/Loaders"
+
+    def load_checkpoint(self, ckpt_name, output_vae=True, output_clip=True):
+        ckpt_path = comfy_paths.get_full_path("checkpoints", ckpt_name)
+        out = comfy.sd.load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, embedding_directory=comfy_paths.get_folder_paths("embeddings"))
+        return (out[0], out[1], out[2], os.path.splitext(os.path.basename(ckpt_name))[0])
+
+class WAS_Diffusers_Loader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        paths = []
+        for search_path in comfy_paths.get_folder_paths("diffusers"):
+            if os.path.exists(search_path):
+                paths += next(os.walk(search_path))[1]
+        return {"required": {"model_path": (paths,), }}
+    RETURN_TYPES = ("MODEL", "CLIP", "VAE", "STRING")
+    RETURN_NAMES = ("MODEL", "CLIP", "VAE", "NAME_STRING")
+    FUNCTION = "load_checkpoint"
+
+    CATEGORY = "WAS Suite/Loaders/Advanced"
+
+    def load_checkpoint(self, model_path, output_vae=True, output_clip=True):
+        for search_path in comfy_paths.get_folder_paths("diffusers"):
+            if os.path.exists(search_path):
+                paths = next(os.walk(search_path))[1]
+                if model_path in paths:
+                    model_path = os.path.join(search_path, model_path)
+                    break
+
+        out = comfy.diffusers_convert.load_diffusers(model_path, fp16=model_management.should_use_fp16(), output_vae=output_vae, output_clip=output_clip, embedding_directory=comfy_paths.get_folder_paths("embeddings"))
+        return (out[0], out[1], out[2], os.path.basename(model_path))
+
+
+class WAS_unCLIP_Checkpoint_Loader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": { "ckpt_name": (comfy_paths.get_filename_list("checkpoints"), ),
+                             }}
+    RETURN_TYPES = ("MODEL", "CLIP", "VAE", "CLIP_VISION", "STRING")
+    RETURN_NAMES = ("MODEL", "CLIP", "VAE", "CLIP_VISION", "NAME_STRING")
+    FUNCTION = "load_checkpoint"
+
+    CATEGORY = "WAS Suite/Loaders"
+    
+    def load_checkpoint(self, ckpt_name, output_vae=True, output_clip=True):
+        ckpt_path = comfy_paths.get_full_path("checkpoints", ckpt_name)
+        out = comfy.sd.load_checkpoint_guess_config(ckpt_path, output_vae=True, output_clip=True, output_clipvision=True, embedding_directory=comfy_paths.get_folder_paths("embeddings"))
+        return (out[0], out[1], out[2], out[3], os.path.splitext(os.path.basename(ckpt_name))[0])
+        
+class WAS_Lora_Loader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": { "model": ("MODEL",),
+                              "clip": ("CLIP", ),
+                              "lora_name": (comfy_paths.get_filename_list("loras"), ),
+                              "strength_model": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
+                              "strength_clip": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
+                              }}
+    RETURN_TYPES = ("MODEL", "CLIP", "STRING")
+    RETURN_NAMES = ("MODEL", "CLIP", "NAME_STRING")
+    FUNCTION = "load_lora"
+
+    CATEGORY = "WAS Suite/Loaders"
+
+    def load_lora(self, model, clip, lora_name, strength_model, strength_clip):
+        lora_path = comfy_paths.get_full_path("loras", lora_name)
+        model_lora, clip_lora = comfy.sd.load_lora_for_models(model, clip, lora_path, strength_model, strength_clip)
+        return (model_lora, clip_lora, os.path.splitext(os.path.basename(lora_name))[0])
+        
+class WAS_Upscale_Model_Loader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": { "model_name": (comfy_paths.get_filename_list("upscale_models"), ),
+                             }}
+    RETURN_TYPES = ("UPSCALE_MODEL",TEXT_TYPE)
+    RETURN_NAMES = ("UPSCALE_MODEL","MODEL_NAME_TEXT")
+    FUNCTION = "load_model"
+
+    CATEGORY = "WAS Suite/Loaders"
+
+    def load_model(self, model_name):
+        model_path = comfy_paths.get_full_path("upscale_models", model_name)
+        sd = comfy.utils.load_torch_file(model_path)
+        out = model_loading.load_state_dict(sd).eval()
+        return (out,model_name)
+        
+# VIDEO WRITER
+
+class WAS_Video_Writer:
+    def __init__(self):
+        pass
+        
+    @classmethod
+    def INPUT_TYPES(cls):
+        WTools = WAS_Tools_Class()
+        v = WTools.VideoWriter()
+        codecs = []
+        for codec in v.get_codecs():
+            codecs.append(codec.upper())
+        codecs = sorted(codecs)
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "transition_frames": ("INT", {"default":30, "min":0, "max":120, "step":1}),
+                "image_delay_sec": ("FLOAT", {"default":2.5, "min":0.1, "max":60000.0, "step":0.1}),
+                "fps": ("INT", {"default":30, "min":1, "max":60.0, "step":1}),
+                "max_size": ("INT", {"default":512, "min":128, "max":1920, "step":1}),
+                "output_path": ("STRING", {"default": "./ComfyUI/output", "multiline": False}),
+                "filename": ("STRING", {"default": "comfy_writer", "multiline": False}),
+                "codec": (codecs,),
+            }
+        }
+        
+    #@classmethod
+    #def IS_CHANGED(cls, **kwargs):
+    #    return float("NaN")
+        
+    RETURN_TYPES = ("IMAGE",TEXT_TYPE,TEXT_TYPE)
+    RETURN_NAMES = ("IMAGE_PASS","filepath_text","filename_text")
+    FUNCTION = "write_video"
+    
+    CATEGORY = "WAS Suite/Animation/Writer"
+    
+    def write_video(self, image, transition_frames=10, image_delay_sec=10, fps=30, max_size=512, 
+                            output_path="./ComfyUI/output", filename="morph", codec="H264"):
+        
+        conf = getSuiteConfig()
+        if not conf.__contains__('ffmpeg_bin_path'):
+            print(f"\033[34mWAS Node Suite\033[0m Error: Unable to use MP4 Writer because the `ffmpeg_bin_path` is not set in `{WAS_CONFIG_FILE}`")
+            return (image,"","")
+
+        if conf.__contains__('ffmpeg_bin_path'):
+            if conf['ffmpeg_bin_path'] != "/path/to/ffmpeg":
+                sys.path.append(conf['ffmpeg_bin_path'])
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp"
+                os.environ['OPENCV_FFMPEG_BINARY'] = conf['ffmpeg_bin_path']
+        
+        if output_path.strip() in [None, "", "."]:
+            output_path = "./ComfyUI/output"
+            
+        if image == None:
+            image = pil2tensor(Image.new("RGB", (512,512), (0,0,0)))
+            
+        if transition_frames < 0:
+            transition_frames = 0
+        elif transition_frames > 60:
+            transition_frames = 60
+        
+        if fps < 1:
+            fps = 1
+        elif fps > 60:
+            fps = 60
+
+        image = self.rescale_image(tensor2pil(image), max_size)
+            
+        tokens = TextTokens()
+        output_path = os.path.abspath(os.path.join(*tokens.parseTokens(output_path).split('/')))
+        output_file = os.path.join(output_path, tokens.parseTokens(filename))
+        
+        if not os.path.exists(output_path):
+            os.makedirs(output_path, exist_ok=True)
+        
+        WTools = WAS_Tools_Class()
+        MP4Writer = WTools.VideoWriter(int(transition_frames), int(fps), int(image_delay_sec), max_size, codec)
+        path = MP4Writer.write(image, output_file)
+        
+        return (pil2tensor(image), path, filename)
+        
+    def rescale_image(self, image, max_dimension):
+        width, height = image.size
+        if width > max_dimension or height > max_dimension:
+            scaling_factor = max(width, height) / max_dimension
+            new_width = int(width / scaling_factor)
+            new_height = int(height / scaling_factor)
+            image = image.resize((new_width, new_height), Image.Resampling(1))
+        return image
+        
+# VIDEO CREATOR 
+
+class WAS_Create_Video_From_Path:
+    def __init__(self):
+        pass
+        
+    @classmethod
+    def INPUT_TYPES(cls):
+        WTools = WAS_Tools_Class()
+        v = WTools.VideoWriter()
+        codecs = []
+        for codec in v.get_codecs():
+            codecs.append(codec.upper())
+        codecs = sorted(codecs)
+        return {
+            "required": {
+                "transition_frames": ("INT", {"default":30, "min":0, "max":120, "step":1}),
+                "image_delay_sec": ("FLOAT", {"default":2.5, "min":0.01, "max":60000.0, "step":0.01}),
+                "fps": ("INT", {"default":30, "min":1, "max":60.0, "step":1}),
+                "max_size": ("INT", {"default":512, "min":128, "max":1920, "step":1}),
+                "input_path": ("STRING", {"default": "./ComfyUI/input", "multiline": False}),
+                "output_path": ("STRING", {"default": "./ComfyUI/output", "multiline": False}),
+                "filename": ("STRING", {"default": "comfy_video", "multiline": False}),
+                "codec": (codecs,),
+            }
+        }
+        
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("NaN")
+        
+    RETURN_TYPES = (TEXT_TYPE,TEXT_TYPE)
+    RETURN_NAMES = ("filepath_text","filename_text")
+    FUNCTION = "create_video_from_path"
+    
+    CATEGORY = "WAS Suite/Animation"
+    
+    def create_video_from_path(self, transition_frames=10, image_delay_sec=10, fps=30, max_size=512, 
+                            input_path="./ComfyUI/input", output_path="./ComfyUI/output", filename="morph", codec="H264"):
+        
+        conf = getSuiteConfig()
+        if not conf.__contains__('ffmpeg_bin_path'):
+            print(f"\033[34mWAS Node Suite\033[0m Error: Unable to use MP4 Writer because the `ffmpeg_bin_path` is not set in `{WAS_CONFIG_FILE}`")
+            return ("","")
+
+        if conf.__contains__('ffmpeg_bin_path'):
+            if conf['ffmpeg_bin_path'] != "/path/to/ffmpeg":
+                sys.path.append(conf['ffmpeg_bin_path'])
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp"
+                os.environ['OPENCV_FFMPEG_BINARY'] = conf['ffmpeg_bin_path']
+        
+        if output_path.strip() in [None, "", "."]:
+            output_path = "./ComfyUI/output"
+            
+        if transition_frames < 0:
+            transition_frames = 0
+        elif transition_frames > 60:
+            transition_frames = 60
+        
+        if fps < 1:
+            fps = 1
+        elif fps > 60:
+            fps = 60
+            
+        tokens = TextTokens()
+        output_path = os.path.abspath(os.path.join(*tokens.parseTokens(output_path).split('/')))
+        output_file = os.path.join(output_path, tokens.parseTokens(filename))
+        
+        if not os.path.exists(output_path):
+            os.makedirs(output_path, exist_ok=True)
+        
+        WTools = WAS_Tools_Class()
+        MP4Writer = WTools.VideoWriter(int(transition_frames), int(fps), int(image_delay_sec), max_size, codec)
+        path = MP4Writer.create_video(input_path, output_file)
+        
+        return (path, filename)
+        
+# CACHING
+
+class WAS_Cache:
+    def __init__(self):
+        pass
+        
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent_suffix": ("STRING", {"default": str(random.randint(999999, 99999999))+"_cache", "multiline":False}),
+                "image_suffix": ("STRING", {"default": str(random.randint(999999, 99999999))+"_cache", "multiline":False}),
+                "conditioning_suffix": ("STRING", {"default": str(random.randint(999999, 99999999))+"_cache", "multiline":False}),
+            },
+            "optional": {
+                "latent": ("LATENT",),
+                "image": ("IMAGE",),
+                "conditioning": ("CONDITIONING",),
+            }
+        }
+        
+    RETURN_TYPES = (TEXT_TYPE,TEXT_TYPE,TEXT_TYPE)
+    RETURN_NAMES = ("latent_filename","image_filename","conditioning_filename")
+    FUNCTION = "cache_input"
+
+    CATEGORY = "WAS Suite/IO"
+
+    def cache_input(self, latent_suffix="_cache", image_suffix="_cache", conditioning_suffix="_cache", latent=None, image=None, conditioning=None):
+
+        if 'joblib' not in packages():
+            print("\033[34mWAS Node Suite:\033[0m Installing joblib...")
+            subprocess.check_call([sys.executable, '-m', 'pip', '-q', 'install', 'joblib'])
+            
+        import joblib
+            
+        output = os.path.join(WAS_SUITE_ROOT, 'cache')
+        if not os.path.exists(output):
+            os.makedirs(output, exist_ok=True)
+
+        l_filename = ""
+        i_filename = ""
+        c_filename = ""
+        
+        if latent != None:
+            l_filename = f'l_{latent_suffix}.latent'
+            out_file = os.path.join(output, l_filename)
+            joblib.dump(latent, out_file)
+            print(f"\033[34mWAS Node Suite:\033[0m Latent saved to: {out_file}")     
+            
+        if image != None:
+            i_filename = f'i_{image_suffix}.image'
+            out_file = os.path.join(output, i_filename)
+            joblib.dump(image, out_file)
+            print(f"\033[34mWAS Node Suite:\033[0m Tensor batch saved to: {out_file}")     
+        
+        if conditioning != None:
+            c_filename = f'c_{conditioning_suffix}.conditioning'
+            out_file = os.path.join(output, c_filename)
+            joblib.dump(conditioning, os.path.join(output, out_file))
+            print(f"\033[34mWAS Node Suite:\033[0m Conditioning saved to: {out_file}")     
+            
+        return (l_filename, i_filename, c_filename)
+        
+        
+class WAS_Load_Cache:
+    def __init__(self):
+        pass
+        
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "latent_filename": ("STRING", {"default": "", "multiline":False}),
+                "image_filename": ("STRING", {"default": "", "multiline":False}),
+                "conditioning_filename": ("STRING", {"default": "", "multiline":False}),
+            }
+        }
+        
+    RETURN_TYPES = ("LATENT","IMAGE","CONDITIONING")
+    RETURN_NAMES = ("LATENT","IMAGE","CONDITIONING")
+    FUNCTION = "load_cache"
+
+    CATEGORY = "WAS Suite/IO"
+
+    def load_cache(self, latent_filename=None, image_filename=None, conditioning_filename=None):
+
+        if 'joblib' not in packages():
+            print("\033[34mWAS Node Suite:\033[0m Installing joblib...")
+            subprocess.check_call([sys.executable, '-m', 'pip', '-q', 'install', 'joblib'])
+            
+        import joblib
+        
+        input_path = os.path.join(WAS_SUITE_ROOT, 'cache')
+        
+        latent = None
+        image = None
+        conditioning = None
+        
+        if latent_filename not in ["",None]:
+            file = os.path.join(input_path, latent_filename)
+            if os.path.exists(file):
+                latent = joblib.load(file)
+            else:
+                print(f"\033[34mWAS Node Suite\033[0m Error: Unable to locate cache file {file}")     
+                
+        if image_filename not in ["",None]:
+            file = os.path.join(input_path, image_filename)
+            if os.path.exists(file):
+                image = joblib.load(file)
+            else:
+                print(f"\033[34mWAS Node Suite\033[0m Error: Unable to locate cache file {file}")               
+                
+        if conditioning_filename not in ["",None]:
+            file = os.path.join(input_path, conditioning_filename)
+            if os.path.exists(file):
+                conditioning = joblib.load(file)
+            else:
+                print(f"\033[34mWAS Node Suite\033[0m Error: Unable to locate cache file {file}")
+            
+        return (latent, image, conditioning)
 
 # NODE MAPPING
 NODE_CLASS_MAPPINGS = {
+    "Cache Node": WAS_Cache,
+    "Checkpoint Loader": WAS_Checkpoint_Loader, 
+    "Checkpoint Loader (Simple)": WAS_Checkpoint_Loader_Simple,
     "CLIPTextEncode (NSP)": WAS_NSP_CLIPTextEncoder,
     "Conditioning Input Switch": WAS_Conditioning_Input_Switch,
     "Constant Number": WAS_Constant_Number,
+    "Create Grid Image": WAS_Image_Grid_Image,
+    "Create Morph Image": WAS_Image_Morph_GIF, 
+    "Create Morph Image from Path": WAS_Image_Morph_GIF_By_Path,
+    "Create Video from Path": WAS_Create_Video_From_Path,
     "Debug Number to Console": WAS_Debug_Number_to_Console,
     "Dictionary to Console": WAS_Dictionary_To_Console,
+    "Diffusers Model Loader": WAS_Diffusers_Loader,
     "Latent Input Switch": WAS_Latent_Input_Switch,
+    "Load Cache": WAS_Load_Cache,
     "Logic Boolean": WAS_Boolean,
+    "Lora Loader": WAS_Lora_Loader,
     "Image Analyze": WAS_Image_Analyze,
     "Image Blank": WAS_Image_Blank,
     "Image Blend by Mask": WAS_Image_Blend_Mask,
@@ -6089,6 +7896,11 @@ NODE_CLASS_MAPPINGS = {
     "Image Canny Filter": WAS_Canny_Filter,
     "Image Chromatic Aberration": WAS_Image_Chromatic_Aberration,
     "Image Color Palette": WAS_Image_Color_Palette,
+    "Image Crop Face": WAS_Image_Crop_Face,
+    "Image Crop Location": WAS_Image_Crop_Location,
+    "Image Paste Face": WAS_Image_Paste_Face_Crop,
+    "Image Paste Crop": WAS_Image_Paste_Crop,
+    "Image Paste Crop by Location": WAS_Image_Paste_Crop_Location,
     "Image Dragan Photography Filter": WAS_Dragon_Filter,
     "Image Edge Detection Filter": WAS_Image_Edge,
     "Image Film Grain": WAS_Film_Grain,
@@ -6136,6 +7948,7 @@ NODE_CLASS_MAPPINGS = {
     "Number to Float": WAS_Number_To_Float,
     "Number Input Switch": WAS_Number_Input_Switch,
     "Number Input Condition": WAS_Number_Input_Condition,
+    "Number Multiple Of": WAS_Number_Multiple_Of, 
     "Number PI": WAS_Number_PI,
     "Number to Int": WAS_Number_To_Int,
     "Number to Seed": WAS_Number_To_Seed,
@@ -6151,6 +7964,7 @@ NODE_CLASS_MAPPINGS = {
     "SAM Parameters": WAS_SAM_Parameters,
     "SAM Parameters Combine": WAS_SAM_Combine_Parameters,
     "SAM Image Mask": WAS_SAM_Image_Mask,
+    "String to Text": WAS_String_To_Text,
     "Image Bounds": WAS_Image_Bounds,
     "Inset Image Bounds": WAS_Inset_Image_Bounds,
     "Bounded Image Blend": WAS_Bounded_Image_Blend,
@@ -6174,7 +7988,46 @@ NODE_CLASS_MAPPINGS = {
     "Text String": WAS_Text_String,
     "Text to Conditioning": WAS_Text_to_Conditioning,
     "Text to Console": WAS_Text_to_Console,
+    "Text to Number": WAS_Text_To_Number,
     "Text to String": WAS_Text_To_String,
-}
+    "True Random.org Number Generator": WAS_True_Random_Number,
+    "unCLIP Checkpoint Loader": WAS_unCLIP_Checkpoint_Loader,
+    "Upscale Model Loader": WAS_Upscale_Model_Loader,
+    "Write to GIF": WAS_Image_Morph_GIF_Writer,
+    "Write to Video": WAS_Video_Writer,
+}    
 
+# opencv-python-headless handling
+if 'opencv-python' in packages() or 'opencv-python-headless' in packages():
+    try:
+        import cv2
+        build_info = ' '.join(cv2.getBuildInformation().split())
+        if "FFMPEG: YES" in build_info:
+            print("\033[34mWAS Node Suite:\033[0m OpenCV Python FFMPEG support is enabled")
+            if was_config.__contains__('ffmpeg_bin_path'):
+                if was_config['ffmpeg_bin_path'] == "/path/to/ffmpeg":
+                    print(f"\033[34mWAS Node Suite\033[0m Warning: `ffmpeg_bin_path` is not set in `{WAS_CONFIG_FILE}` config file. Will attempt to use system ffmpeg binaries if available.") 
+                else:
+                    print("\033[34mWAS Node Suite:\033[0m `ffmpeg_bin_path` is set to:", was_config['ffmpeg_bin_path'])                 
+        else:
+            print("\033[34mWAS Node Suite: \033[93mOpenCV Python FFMPEG support is not enabled\033[0m. OpenCV Python FFMPEG support, and FFMPEG binaries is required for video writing.")
+    except ImportError:
+        print("\033[34mWAS Node Suite: \033[93mOpenCV Python module cannot be found. Attempting install...")
+        subprocess.check_call([sys.executable, '-m', 'pip', 'uninstall', 'opencv-python', 'opencv-python-headless[ffmpeg]'])
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'opencv-python-headless[ffmpeg]'])
+        try:
+            import cv2
+            print("\033[34mWAS Node Suite:\033[0m OpenCV Python installed.")
+        except ImportError:
+            print("\033[34mWAS Node Suite: \033[93mOpenCV Python module still cannot be imported. There is a system conflict.")
+else:
+    print("\033[34mWAS Node Suite:\033[0m Installing `opencv-python-headless` ...")
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'opencv-python-headless[ffmpeg]'])
+    try:
+        import cv2
+        print("\033[34mWAS Node Suite:\033[0m OpenCV Python installed.")
+    except ImportError:
+        print("\033[34mWAS Node Suite: \033[93mOpenCV Python module still cannot be imported. There is a system conflict.")
+
+# Well we got here, we're as loaded as we're gonna get. 
 print('\033[34mWAS Node Suite: \033[92mLoaded\033[0m')

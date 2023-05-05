@@ -6,13 +6,13 @@
 
 ### A node suite for [ComfyUI](https://github.com/comfyanonymous/ComfyUI) with many new nodes, such as image processing, text processing, and more. 
 
-### [Share Workflows](/workflows/README.md) to the `/workflows/` directory. Preferably embedded PNGs with workflows, but JSON is OK too. [You can use this tool to add a workflow to a PNG file easily](https://colab.research.google.com/drive/1hQMjNUdhMQ3rw1Wcm3_umvmOMeS_K4s8?usp=sharing)
+### [Share Workflows](https://github.com/WASasquatch/was-node-suite-comfyui/wiki/Workflow-Examples) to the workflows wiki. Preferably embedded PNGs with workflows, but JSON is OK too. [You can use this tool to add a workflow to a PNG file easily](https://colab.research.google.com/drive/1hQMjNUdhMQ3rw1Wcm3_umvmOMeS_K4s8?usp=sharing)
 
 # Important Updates
 
  - `ASCII` **is deprecated**. The new preferred method of text node output is `TEXT`. This is a change from `ASCII` so that it is more clear what data is being passed.
-   - The `was_suit_config.json` will automatically set `use_legacy_ascii_text` to `true` for a transition period. You can enable `TEXT` output by setting `use_legacy_ascii_text` to `false` 
-
+   - The `was_suite_config.json` will automatically set `use_legacy_ascii_text` to `true` for a transition period. You can enable `TEXT` output by setting `use_legacy_ascii_text` to `false` 
+ -  [Video Nodes](https://github.com/WASasquatch/was-node-suite-comfyui#video-nodes) - There are two new video nodes, `Write to Video` and `Create Video from Path`. These are experimental nodes. 
 
 # Current Nodes:
 
@@ -34,9 +34,18 @@
  - Bounded Image Blend with Mask: Blend a bounds image by mask
  - Bounded Image Crop: Crop a bounds image
  - Bounded Image Crop with Mask: Crop a bounds image by mask
- - CLIPTextEncode (NSP): Parse Noodle Soup Prompts
+ - Cache Node: Cache Latnet, Tensor Batches (Image), and Conditioning to disk to use later.
+ - CLIPTextEncode (NSP): Parse noodle soups from the NSP pantry, or parse wildcards from a directory containing A1111 style wildacrds.
+   - Wildcards are in the style of `__filename__`, which also includes subdirectories like `__appearance/haircolour__` (if you noodle_key is set to `__`)
+   - You can set a custom wildcards path in `was_suite_config.json` file with key:
+     - `    "wildcards_path": "E:\\python\\automatic\\webui3\\stable-diffusion-webui\\extensions\\sd-dynamic-prompts\\wildcards"`
+     - If no path is set the wildcards dir is located at the root of WAS Node Suite as `/wildcards`
  - Conditioning Input Switch: Switch between two conditioning inputs.
  - Constant Number
+ - Create Grid Image: Create a image grid from images at a destination with customizable glob pattern. Optional border size and color. 
+ - Create Morph Image: Create a GIF/APNG animation from two images, fading between them. 
+ - Create Morph Image by Path: Create a GIF/APNG animation from a path to a directory containing images, with optional pattern. 
+ - Create Video from Path: Create video from images from a specified path. 
  - Dictionary to Console: Print a dictionary input to the console
  - Image Analyze
    - Black White Levels
@@ -54,6 +63,21 @@
      - Depends on `scikit-learn`, will attempt to install on first run. 
    - Supports color range of 8-256
    - Utilizes font in `./res/` unless unavailable, then it will utilize internal better then nothing font. 
+ - Image Crop Face: Crop a face out of a image
+   - **Limitations:**
+     - Sometimes no faces are found in badly generated images, or faces at angles
+	 - Sometimes face crop is black, this is because the padding is too large and intersected with the image edge. Use a smaller padding size.
+	 - face_recognition mode sometimes finds random things as faces. It also requires a [CUDA] GPU.
+	 - Only detects one face. This is a design choice to make it's use easy.
+   - **Notes:**
+     - Detection runs in succession. If nothing is found with the selected detection cascades, it will try the next available cascades file.
+ - Image Crop Location: Crop a image to specified location in top, left, right, and bottom locations relating to the pixel dimensions of the image in X and Y coordinats.
+ - Image Paste Face Crop: Paste face crop back on a image at it's original location and size
+   - Features a better blending funciton than GFPGAN/CodeFormer so there shouldn't be visible seams, and coupled with Diffusion Result, looks better than GFPGAN/CodeFormer. 
+ - Image Paste Crop: Paste a crop (such as from Image Crop Location) at it's original location and size utilizing the `crop_data` node input. This uses a different blending algorithm then Image Paste Face Crop, which may be desired in certain instances.
+   - Samplers can resize/crop odd sized images
+ - Image Paste Crop by Location: Paste a crop top a custom location. This uses the same blending algorithm as Image Paste Crop. 
+   - Samplers can resize/crop odd sized images
  - Image Dragan Photography Filter: Apply a Andrzej Dragan photography style to a image
  - Image Edge Detection Filter: Detect edges in a image
  - Image Film Grain: Apply film grain to a image
@@ -99,6 +123,7 @@
    - A custom implementation of the worley voronoi noise diagram
  - Input Switch  (Disable until `*` wildcard fix)
  - KSampler (WAS): A sampler that accepts a seed as a node inpu
+ - Load Cache: Load cached Latent, Tensor Batch (image), and Conditioning files. 
  - Load Text File
    - Now supports outputting a dictionary named after the file, or custom input. 
    - The dictionary contains a list of all lines in the file.
@@ -106,7 +131,8 @@
    - Increment images in a folder, or fetch a single image out of a batch.
    - Will reset it's place if the path, or pattern is changed.
    - pattern is a glob that allows you to do things like `**/*` to get all files in the directory and subdirectory
-     or things like `*.jpg` to select only JPEG images in the directory specified. 
+     or things like `*.jpg` to select only JPEG images in the directory specified.
+ - ComfyUI Loaders: A set of ComfyUI loaders that also output a string that contains the name of the model being loaded. 
  - Latent Noise Injection: Inject latent noise into a latent image
  - Latent Size to Number: Latent sizes in tensor width/height
  - Latent Upscale by Factor: Upscale a latent image by a factor
@@ -142,12 +168,40 @@
  - Text Random Line: Select a random line from a text input string
  - Text String: Write a single line text string value
  - Text to Conditioning: Convert a text string to conditioning.
- 
+ - True Random.org Number Generator: Generate a truly random number online from atmospheric noise with [Random.org](https://random.org/)
+   - [Get your API key from your account page](https://accounts.random.org/)
+ - Write to Morph GIF: Write a new frame to an existing GIF (or create new one) with interpolation between frames. 
+ - Write to Video: Write a frame as you generate to a video (Best used with FFV1 for lossless images)
 </details>
  
  <br>
  
- ---
+---
+ 
+ 
+## Video Nodes
+
+### Codecs
+You can use codecs that are available to your ffmpeg binaries by adding their fourcc ID (in one string), and appropriate container extension to the `was_suite_config.json`
+
+Example [H264 Codecs](https://github.com/cisco/openh264/releases/tag/v1.8.0) (Defaults)
+```
+    "ffmpeg_extra_codecs": {
+        "avc1": ".mp4",
+        "h264": ".mkv"
+    }
+```
+
+### Notes
+  - For now I am only supporting **Windows** installations for video nodes.
+    - I do not have access to Mac or a stand-alone linux distro. If you get them working and want to PR a patch/directions, feel free. 
+  - Video nodes require [FFMPEG](https://ffmpeg.org/download.html). You should download the proper FFMPEG binaries for you system and set the FFMPEG path in the config file. 
+  - Additionally, if you want to use H264 codec need to [download OpenH264 1.8.0](https://github.com/cisco/openh264/releases/tag/v1.8.0) and place it in the root of ComfyUI (Example: `C:\ComfyUI_windows_portable`). 
+  - FFV1 will complain about invalid container. You can ignore this. The resulting MKV file is readable. I have not figured out what this issue is about. Documentaion tells me to use MKV, but it's telling me it's unsupported.
+    - If you know how to resolve this, I'd love a PR
+  - `Write to Video` node should use a lossless video codec or when it copies frames, and reapplies compression, it will start expontentially ruining the starting frames run to run. 
+
+---
  
 # Text Tokens
 Text tokens can be used in the Save Text File and Save Image nodes. You can also add your own custom tokens with the Text Add Tokens node.
@@ -224,7 +278,12 @@ You can set `webui_styles_persistent_update` to `true` to update the WAS Node Su
 If you're running on Linux, or non-admin account on windows you'll want to ensure `/ComfyUI/custom_nodes`, `was-node-suite-comfyui`, and `WAS_Node_Suite.py` has write permissions.
 
   - Navigate to your `/ComfyUI/custom_nodes/` folder
-  - `git clone https://github.com/WASasquatch/was-node-suite-comfyui/`
+  - Run `git clone https://github.com/WASasquatch/was-node-suite-comfyui/`
+  - Navigate to your `was-node-suite-comfyui` folder
+    - Portable/venv:
+       - Run `path/to/ComfUI/python_embeded/python.exe -m pip install -r requirements.txt`
+	- With system python
+	   - Run `pip install -r requirements.txt`
   - Start ComfyUI
     - WAS Suite should uninstall legacy nodes automatically for you.
     - Tools will be located in the WAS Suite menu.
@@ -234,31 +293,16 @@ If you're running on Linux, or non-admin account on windows you'll want to ensur
 
   - Download `WAS_Node_Suite.py`
   - Move the file to your `/ComfyUI/custom_nodes/` folder
+  - WAS Node Suite will attempt install dependencies on it's own, but you may need to manually do so. The dependencies required are in the `requirements.txt` on this repo. See installation steps above.
   - Start, or Restart ComfyUI
     - WAS Suite should uninstall legacy nodes automatically for you.
     - Tools will be located in the WAS Suite menu.
 	
+This method will not install the resources required for Image Crop Face node, and you'll have to download the [./res/](https://github.com/WASasquatch/was-node-suite-comfyui/tree/main/res) folder yourself. 
+	
 ## Installing on Colab
-Create a new cell and add the following code, then run the cell. You may need to edit the path to your `custom_nodes` folder. 
+Create a new cell and add the following code, then run the cell. You may need to edit the path to your `custom_nodes` folder. You can also use the [colab hosted here](https://colab.research.google.com/github/WASasquatch/comfyui-colab-was-node-suite/blob/main/ComfyUI_%2B_WAS_Node_Suite.ipynb)
 
   - `!git clone https://github.com/WASasquatch/was-node-suite-comfyui /content/ComfyUI/custom_nodes/was-node-suite-comfyui`
   - Restart Colab Runtime (don't disconnect)
     - Tools will be located in the WAS Suite menu.
-
-      
-### Dependencies:
-WAS Node Suite is designed to download dependencies on it's own as needed, but what it depends on can be installed manually before use to prevent any script issues. The dependencies which are not required by ComfyUI are as follows: 
-  - BLIP
-    - Requires `transformers==4.26.1`
-      - You can try to manually install from your `/python_embeds/` folder run `.\python.exe -m pip install --user --upgrade --force-reinstall transformers==4.26.1`
-  - opencv
-  - scipy
-  - [pilgram](https://github.com/akiomik/pilgram)
-  - timm (for MiDaS and BLIP)
-    - MiDaS Models (they will download automatically upon use and be stored in `/ComfyUI/models/midas/checkpoints/`, additional files may be installed by `PyTorch Hub`)
-  - [img2texture](https://github.com/WASasquatch/img2texture) (for Image Seamless Texture node)
-  - [pythonperlin](https://pypi.org/project/pythonperlin/)
-    - Used for the perlin noise. I tried writing three different perlin noise functions but I couldn't get things as fast as this library, even with numpy, and that was really hard to figure out. Haha. I'm just terrible with math. Feel free to PR a in-house version so long as it doesn't take longer than a few seconds. Fastest I got was nearly a minute... Lol
-  - PythonGit
-    - For downloading repos (such as BLIP)
-	
